@@ -17,6 +17,7 @@
 
 #include "named_barrier.hpp"
 #include "seqlen.h"
+#include "block.h"
 #include "mask.h"
 #include "softmax.h"
 #include "utils.h"
@@ -48,7 +49,6 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
-    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, CUTE_STATIC_V(get<0>(TileShape_MNK{}))>;
 
     static constexpr bool SdP_swapAB = SdP_swapAB_;
     static constexpr bool dKV_swapAB = dKV_swapAB_;
@@ -59,6 +59,9 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+
+    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, kBlockM>;
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local>;
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
     static_assert(get<0>(ClusterShape{}) == 1 && get<2>(ClusterShape{}) == 1);
@@ -295,8 +298,10 @@ struct CollectiveMainloopBwdSm90 {
         ShapeQKV const shape_K;
         StrideQKV const stride_K;
         Element const* const ptr_V;
+        ShapeQKV const shape_V;
         StrideQKV const stride_V;
         Element const* const ptr_dO;
+        ShapeQKV const shape_dO;
         StrideQKV const stride_dO;
         ElementAccum* const ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
@@ -307,7 +312,7 @@ struct CollectiveMainloopBwdSm90 {
         float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right, attention_chunk;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -321,6 +326,8 @@ struct CollectiveMainloopBwdSm90 {
     struct Params {
         ShapeQKV const shape_Q;
         ShapeQKV const shape_K;
+        ShapeQKV const shape_V;
+        ShapeQKV const shape_dO;
         ElementAccum* const ptr_dQaccum;
         ShapedQaccum const shape_dQaccum;
         StridedQaccum stride_dQaccum;
@@ -334,7 +341,8 @@ struct CollectiveMainloopBwdSm90 {
         float const* const ptr_dPsum;
         StrideLSE const stride_dPsum;
         float const softmax_scale, softmax_scale_log2;
-        int const window_size_left, window_size_right, sink_token_length;
+        int const window_size_left, window_size_right;
+        cutlass::FastDivmod attention_chunk_divmod;
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
@@ -353,7 +361,7 @@ struct CollectiveMainloopBwdSm90 {
             SmemLayoutQ{}(_, _, _0{}),
             TileShape_MNK{},
             ClusterShape{}); // mcast along N mode for this M load, if any
-        Tensor mdO = make_tensor(make_gmem_ptr(args.ptr_dO), args.shape_Q, args.stride_dO);
+        Tensor mdO = make_tensor(make_gmem_ptr(args.ptr_dO), args.shape_dO, args.stride_dO);
         TMA_QdO tma_load_dO = make_tma_copy_A_sm90(
             GmemTiledCopyQdO{},
             mdO,
@@ -367,7 +375,7 @@ struct CollectiveMainloopBwdSm90 {
             SmemLayoutK{},
             TileShape_MNK{},
             ClusterShape{}); // no mcast for KV
-        Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V), args.shape_K, args.stride_V);
+        Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V), args.shape_V, args.stride_V);
         TMA_V tma_load_V = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
             mV,
@@ -375,6 +383,9 @@ struct CollectiveMainloopBwdSm90 {
             TileShape_MNK{},
             ClusterShape{}); // no mcast for KV
         if constexpr (Deterministic) { assert(args.dq_semaphore != nullptr); }
+        // Avoid dividing by zero
+        cutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
+        attention_chunk_divmod.divisor = args.attention_chunk;
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -384,14 +395,15 @@ struct CollectiveMainloopBwdSm90 {
         // (1 - tanh^2) * softmax_scale / softcap_val * softcap_val = (1 - tanh^2) * softmax_scale.
         // Instead we multiply by (1 - tanh^2) and multiply dK and dV by params.softmax_scale
         // (the original softmax_scale) at the end.
-        return {args.shape_Q, args.shape_K,
+        return {args.shape_Q, args.shape_K, 
+                args.shape_V, args.shape_dO,
                 args.ptr_dQaccum, args.shape_dQaccum, args.stride_dQaccum,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
                 tma_load_Q, tma_load_dO, tma_load_K, tma_load_V,
                 args.ptr_LSE_log2, args.shape_LSE, args.stride_LSE_log2, args.ptr_dPsum, args.stride_dPsum,
                 args.softmax_scale,
                 !Has_softcap ? float(args.softmax_scale * M_LOG2E) : float(args.softcap_val * M_LOG2E),
-                args.window_size_left, args.window_size_right, args.sink_token_length,
+                args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
@@ -404,26 +416,6 @@ struct CollectiveMainloopBwdSm90 {
         cute::prefetch_tma_descriptor(params.tma_load_dO.get_tma_descriptor());
         cute::prefetch_tma_descriptor(params.tma_load_K.get_tma_descriptor());
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
-    }
-
-    CUTLASS_DEVICE
-    cute::tuple<int, int> get_m_block_min_max(Params const& params, SeqlenInfo_t const& seqlen_info,
-                                              int n_block, int bidb) {
-        static constexpr int kBlockM = get<0>(TileShape_MNK{});
-        int const seqlen_q = seqlen_info.seqlen_q;
-        int const seqlen_k = seqlen_info.seqlen_k;
-        int m_block_max = cute::ceil_div(seqlen_q, kBlockM);
-        if constexpr (Is_local) {
-            static constexpr int kBlockN = get<1>(TileShape_MNK{});
-            if (n_block >= cute::ceil_div(params.sink_token_length, kBlockN)) {
-                m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + params.window_size_left, kBlockM));
-            }
-        }
-        int m_block_min = 0;
-        if constexpr (Is_causal || Is_local) {
-            m_block_min = std::max(m_block_min, (n_block * kBlockN + seqlen_q - seqlen_k - params.window_size_right) / kBlockM);
-        }
-        return {m_block_min, m_block_max};
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -443,7 +435,9 @@ struct CollectiveMainloopBwdSm90 {
             bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
             params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
         };
-        auto [m_block_min, m_block_max] = get_m_block_min_max(params, seqlen_info, n_block, bidb);
+        auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
+            seqlen_info, n_block, bidb,
+            params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Loading Q, K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) {
@@ -468,9 +462,9 @@ struct CollectiveMainloopBwdSm90 {
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
-        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_dO)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
-        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
+        Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_V)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
 
@@ -609,7 +603,9 @@ struct CollectiveMainloopBwdSm90 {
             bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
             params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
         };
-        auto [m_block_min, m_block_max] = get_m_block_min_max(params, seqlen_info, n_block, bidb);
+        auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
+            seqlen_info, n_block, bidb, params.window_size_left,
+            params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return; }
@@ -697,7 +693,9 @@ struct CollectiveMainloopBwdSm90 {
             bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
             params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
         };
-        auto [m_block_min, m_block_max] = get_m_block_min_max(params, seqlen_info, n_block, bidb);
+        auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
+            seqlen_info, n_block, bidb, params.window_size_left,
+            params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return false; }
@@ -803,8 +801,8 @@ struct CollectiveMainloopBwdSm90 {
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print(mdQaccum); printf("\n"); print(gdQaccum_); printf("\n"); print(gdQaccum); printf("\n"); print(tdQgdQaccum); printf("\n"); }
 
         flash::Mask<kBlockM, kBlockN, false /*PackGQA*/, TiledMmaSdP, SdP_swapAB> mask(
-            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, params.sink_token_length,
-            params.qhead_per_khead_divmod
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
         int m_block = m_block_min;
