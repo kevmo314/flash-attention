@@ -26,8 +26,8 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtensio
 
 
 # with open("../README.md", "r", encoding="utf-8") as fh:
-with open("../README.md", "r", encoding="utf-8") as fh:
-    long_description = fh.read()
+# with open("../README.md", "r", encoding="utf-8") as fh:
+long_description = "" # fh.read()
 
 
 # ninja build does not work unless include_dirs are abs path
