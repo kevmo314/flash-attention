@@ -863,6 +863,7 @@ def _flash_attn_bwd(
             pack_gqa,
             cluster_size,
             deterministic,
+            cu_seqlens_q is not None or seqused_q is not None,  # is_varlen_q
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -908,6 +909,7 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
             )
         else:
+            is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
             fa_bwd_obj = FlashAttentionBackwardSm100(
                 head_dim,
                 head_dim_v,
@@ -919,6 +921,7 @@ def _flash_attn_bwd(
                 cluster_size=cluster_size,
                 # cluster_size=1,
                 deterministic=deterministic,
+                is_varlen_q=is_varlen_q,
             )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -967,11 +970,14 @@ def _flash_attn_bwd(
         mdV_semaphore=dV_semaphore_tensor,
     )
 
+
     num_threads = 256 if compute_capability == 9 else 128
+    arch = compute_capability * 10
+
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
-    compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
+    # Include arch in compile_key to ensure correct kernel is used for each architecture
+    compile_key_post = (arch, dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
-        arch = compute_capability * 10
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )
@@ -996,10 +1002,10 @@ def _flash_attn_bwd(
 
     if qhead_per_kvhead > 1:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
-        compile_key_post = (dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
+        compile_key_post = (arch, dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1020,6 +1026,7 @@ def _flash_attn_bwd(
             current_stream,
         )
         compile_key_post = (
+            arch,
             dtype,
             head_dim_v,
             n_block_size,
@@ -1029,7 +1036,7 @@ def _flash_attn_bwd(
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1138,50 +1145,47 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens_q: Optional[torch.Tensor],
-        cu_seqlens_k: Optional[torch.Tensor],
-        seqused_q: Optional[torch.Tensor] = None,
-        seqused_k: Optional[torch.Tensor] = None,
-        page_table: Optional[torch.Tensor] = None,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-        learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
-        num_splits: int = 1,
-        pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
     ):
+        # max_seqlen_q and max_seqlen_k are not used in the kernel (inferred from cu_seqlens)
+        # but we accept them for API compatibility with the original flash_attn interface
         out, lse = _flash_attn_fwd(
             q,
             k,
             v,
             cu_seqlens_q,
             cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            page_table=page_table,
+            seqused_q=None,
+            seqused_k=None,
+            page_table=None,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
-            learnable_sink=learnable_sink,
+            learnable_sink=None,
             softcap=softcap,
-            num_splits=num_splits,
-            pack_gqa=pack_gqa,
+            num_splits=1,
+            pack_gqa=None,
         )
-        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
-        return out, lse
+        return out
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
-        assert seqused_q == seqused_k == None
+        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
         assert ctx.softcap == 0.0
         dq, dk, dv = _flash_attn_bwd(
             q,
@@ -1195,12 +1199,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
+            seqused_q=None,
+            seqused_k=None,
             deterministic=ctx.deterministic,
+            window_size_left=ctx.window_size[0],
+            window_size_right=ctx.window_size[1],
         )
 
-        return dq, dk, dv, *((None,) * 20)
+        # Return None for: cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+        # softmax_scale, causal, window_size, softcap, deterministic
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -1245,36 +1253,50 @@ def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    page_table: Optional[torch.Tensor] = None,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-    learnable_sink: Optional[torch.Tensor] = None,
+    window_size: Tuple[int, int] = (-1, -1),
     softcap: float = 0.0,
-    num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
 ):
+    """Variable-length FlashAttention.
+
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into kv.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask.
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Anything > 0 activates softcapping attention.
+        deterministic: bool. Whether to use deterministic backward pass.
+    """
+    # Convert window_size from (-1, -1) convention to (None, None) convention
+    window_size_left = None if window_size[0] == -1 else window_size[0]
+    window_size_right = None if window_size[1] == -1 else window_size[1]
     return FlashAttnVarlenFunc.apply(
         q,
         k,
         v,
         cu_seqlens_q,
         cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        page_table,
+        max_seqlen_q,
+        max_seqlen_k,
         softmax_scale,
         causal,
-        window_size,
-        learnable_sink,
+        (window_size_left, window_size_right),
         softcap,
-        num_splits,
-        pack_gqa,
         deterministic,
     )
 

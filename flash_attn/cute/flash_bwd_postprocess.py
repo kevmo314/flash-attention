@@ -229,22 +229,28 @@ class FlashAttentionBackwardPostprocess:
             cute.size_in_bytes(self.dtype, self.sdQ_layout),
         )
 
+        # For varlen: mdQ is (total, nheads, headdim)
+        # For non-varlen: mdQ is (batch, seqlen, nheads, headdim)
         if const_expr(mCuSeqlensQ is not None):
             TileScheduler = SingleTileVarlenScheduler
-            num_head = mdQ.shape[1]
+            num_head = mdQ.shape[1]  # nheads for varlen
             num_batch = mCuSeqlensQ.shape[0] - 1
+            seqlen_for_blocks = mdQ.shape[0]  # total sequence length
+            headdim = mdQ.shape[2]
         else:
             TileScheduler = SingleTileScheduler
-            num_head = mdQ.shape[2]
+            num_head = mdQ.shape[2]  # nheads for non-varlen
             num_batch = mdQ.shape[0]
+            seqlen_for_blocks = mdQ.shape[1]  # per-batch seqlen
+            headdim = mdQ.shape[3]
 
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(mdQ.shape[1], self.tile_m),
+            num_block=cute.ceil_div(seqlen_for_blocks, self.tile_m),
             num_head=num_head,
             num_batch=num_batch,
             num_splits=1,
             seqlen_k=0,
-            headdim=mdQ.shape[2],
+            headdim=headdim,
             headdim_v=0,
             total_q=mdQ.shape[0],
             tile_shape_mn=(self.tile_m, 1),

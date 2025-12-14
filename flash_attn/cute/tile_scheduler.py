@@ -602,7 +602,6 @@ class SingleTileVarlenScheduler:
         m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
         # Same for all lanes
         group_end_tile = m_blocks_in_group * params.num_head
-        # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d", self._tile_idx, group_end_tile, num_m_blocks, num_m_blocks_cumulative, m_blocks_in_group)
         block, head_idx, batch_idx = Int32(0), Int32(0), Int32(0)
         next_tile_idx = self._tile_idx
         while group_end_tile <= next_tile_idx:
@@ -627,7 +626,7 @@ class SingleTileVarlenScheduler:
             # that is greater than or equal to tile index.
             batch_idx_in_group = cute.arch.popc(
                 cute.arch.vote_ballot_sync(
-                    group_start_tile + num_m_blocks_cumulative * params.num_head <= next_tile_idx
+                    group_start_tile + num_m_blocks_cumulative * params.num_head < next_tile_idx
                 )
             )
             batch_idx += batch_idx_in_group
@@ -682,7 +681,6 @@ class SingleTileVarlenScheduler:
                 head_idx = mh_block // num_m_blocks
                 block = mh_block - head_idx * num_m_blocks
             is_valid = self._is_first_block and batch_idx < params.num_batch
-        # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
         split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
         return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), split_idx), is_valid)
 
