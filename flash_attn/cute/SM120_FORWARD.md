@@ -56,6 +56,31 @@ SM100 subclass:
 7. Re-autotune tiles after the TMA mainloop exists. The current optimal tile
    choices are specific to the SM80-style cp.async implementation.
 
+## Profiling Notes
+
+Nsight Compute basic profiles on RTX PRO 6000 show that the committed tile
+tuning wins primarily by reducing shared memory per block and increasing
+occupancy:
+
+- `head_dim=128`, seqlen 4096, noncausal:
+  - FA2: 64 KB dynamic shared memory, 8.3% achieved occupancy, ~78% SM
+    throughput.
+  - FA4 SM120: 49 KB dynamic shared memory, 16.5% achieved occupancy, ~85% SM
+    throughput.
+- `head_dim=256`, seqlen 4096/8192:
+  - FA2 uses 96 KB dynamic shared memory and is limited to one block per SM.
+  - FA4 SM120 uses 49 KB dynamic shared memory and can run two blocks per SM.
+- `head_dim=64`, seqlen 8192, causal:
+  - FA4 uses less shared memory than FA2, but does not win. A deeper profile
+    showed the same tensor instruction count as FA2 but about 29% more total
+    warp instructions, mostly ALU/FMA overhead, and lower tensor-pipe active
+    percentage. This points to SM80-derived CuTe mainloop/softmax overhead,
+    not DRAM bandwidth.
+
+This reinforces the native-kernel direction: further large gains require
+reducing register pressure and non-tensor instruction overhead, not just
+changing tiles.
+
 ## Why This Should Help
 
 The current SM120 path leaves most of FA4's Blackwell advantage unused. It still

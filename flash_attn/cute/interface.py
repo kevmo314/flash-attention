@@ -553,7 +553,9 @@ def _flash_attn_fwd(
                 fwd_cfg = FwdConfig(128, 64, True, True) if causal or local else FwdConfig(128, 128, True, True)
             elif head_dim <= 128:
                 fwd_cfg = FwdConfig(64, 64, True, True) if causal or local else FwdConfig(128, 32, True, True)
-            elif head_dim >= 192:
+            elif head_dim == 192:
+                fwd_cfg = FwdConfig(64, 64, True, True)
+            elif head_dim > 192:
                 fwd_cfg = FwdConfig(64, 32, True, True)
             else:
                 fwd_cfg = FwdConfig(128, 64, True, True)
