@@ -1035,7 +1035,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                         smem_pipe_read,
                         smem_pipe_write,
                         seqlen=seqlen,
-                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                     )
                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
@@ -1166,7 +1166,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
-        softmax.rescale_O(mma_params.acc_O, row_scale)
+        if const_expr(not is_first_n_block):
+            softmax.rescale_O(mma_params.acc_O, row_scale)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))
         tOrP = layout_utils.reshape_acc_to_frgA(rP)
