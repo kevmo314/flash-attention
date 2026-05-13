@@ -550,10 +550,7 @@ def _flash_attn_fwd(
         if arch // 10 == 12:
             # SM120 tile sizes tuned for 99 KB SMEM capacity.
             if head_dim <= 64:
-                if causal and not local:
-                    fwd_cfg = FwdConfig(64, 128, True, True)
-                else:
-                    fwd_cfg = FwdConfig(128, 64, True, True) if local else FwdConfig(128, 128, True, True)
+                fwd_cfg = FwdConfig(128, 64, True, True) if local else FwdConfig(128, 128, True, True)
             elif head_dim <= 128:
                 fwd_cfg = FwdConfig(64, 64, True, True) if causal or local else FwdConfig(128, 32, True, True)
             elif head_dim == 192:
