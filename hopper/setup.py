@@ -71,6 +71,11 @@ ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TR
 DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "FALSE") == "TRUE"
 DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") == "TRUE"
 
+# Free-threaded Python (3.13t+) does not support the limited API (abi3).
+# See: https://docs.python.org/3/howto/free-threading-extensions.html
+FREE_THREADED = sysconfig.get_config_var("Py_GIL_DISABLED")
+DISABLE_ABI3 = FREE_THREADED or os.getenv("FLASH_ATTENTION_DISABLE_ABI3", "FALSE") == "TRUE"
+
 # HACK: we monkey patch pytorch's _write_ninja_file to pass
 # "-gencode arch=compute_sm90a,code=sm_90a" to files ending in '_sm90.cu',
 # and pass "-gencode arch=compute_sm80,code=sm_80" to files ending in '_sm80.cu'
@@ -693,11 +698,14 @@ if not SKIP_CUDA_BUILD:
             name=f"{PACKAGE_NAME}._C",
             sources=sources,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"] + stable_args + feature_args,
+                "cxx": ["-O3", "-std=c++17"]
+                + ([] if DISABLE_ABI3 else ["-DPy_LIMITED_API=0x03090000"])
+                + stable_args
+                + feature_args,
                 "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
             include_dirs=include_dirs,
-            py_limited_api=True,
+            py_limited_api=not DISABLE_ABI3,
         )
     )
 
@@ -838,5 +846,5 @@ setup(
     },
     python_requires=">=3.10",
     install_requires=install_requires,
-    options={"bdist_wheel": {"py_limited_api": "cp310"}},
+    options={} if DISABLE_ABI3 else {"bdist_wheel": {"py_limited_api": "cp310"}},
 )
