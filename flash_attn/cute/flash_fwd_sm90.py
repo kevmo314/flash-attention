@@ -172,7 +172,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_data: AuxData = AuxData(),
+        aux_data: Optional[AuxData] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -184,6 +184,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
 
+        if const_expr(aux_data is None):
+            aux_data = AuxData()
         self._check_type(
             *(
                 t.element_type if t is not None else None

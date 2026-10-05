@@ -637,7 +637,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_data: AuxData = AuxData(),
+        aux_data: Optional[AuxData] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -648,6 +648,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+        if const_expr(aux_data is None):
+            aux_data = AuxData()
         assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))

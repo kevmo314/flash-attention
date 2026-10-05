@@ -448,7 +448,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_data: AuxData = AuxData(),
+        aux_data: Optional[AuxData] = None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         tile_count_semaphore: Optional[cute.Tensor] = None,
         virtual_batch_idx_ptr: Optional[cute.Tensor] = None,
@@ -474,6 +474,8 @@ class FlashAttentionForwardSm100:
         6. Kernel launch with appropriate parameters
         """
         # setup static attributes before smem/grid/tma computation
+        if const_expr(aux_data is None):
+            aux_data = AuxData()
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type

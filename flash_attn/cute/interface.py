@@ -69,7 +69,7 @@ from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import make_aux_data
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     block_sparse_bwd_supports_2cta,
@@ -1805,7 +1805,7 @@ def _flash_attn_fwd(
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend([
                 sparse_tensors,
-                AuxData(cute_aux_tensors, aux_scalars),
+                make_aux_data(cute_aux_tensors, aux_scalars),
             ])
             if use_dedicated_hd256_kernel:
                 compile_args.append(
@@ -1903,7 +1903,7 @@ def _flash_attn_fwd(
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
-                AuxData(aux_tensors, aux_scalars),
+                make_aux_data(aux_tensors, aux_scalars),
             ])
             if use_dedicated_hd256_kernel:
                 call_args.append(
@@ -2981,7 +2981,7 @@ def _flash_attn_bwd(
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
-            AuxData(cute_aux_tensors, aux_scalars),
+            make_aux_data(cute_aux_tensors, aux_scalars),
             sparse_tensors_compile,
         ]
         if not use_dedicated_hd256_kernel:
@@ -3025,7 +3025,7 @@ def _flash_attn_bwd(
             dQ_semaphore,
             dK_semaphore,
             dV_semaphore,
-            AuxData(aux_tensors, aux_scalars),
+            make_aux_data(aux_tensors, aux_scalars),
             (
                 normalized_block_sparse_tensors.mask_block_cnt,
                 normalized_block_sparse_tensors.mask_block_idx,

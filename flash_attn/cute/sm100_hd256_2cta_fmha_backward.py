@@ -133,13 +133,15 @@ class BlackwellFusedMultiHeadAttentionBackward:
         dQ_semaphore: cute.Tensor | None = None,
         dK_semaphore: cute.Tensor | None = None,
         dV_semaphore: cute.Tensor | None = None,
-        aux_data: AuxData = AuxData(),
+        aux_data: AuxData | None = None,
         block_sparse_tensors: cute.Tensor | None = None,
         max_seqlen_q: Int32 | None = None,
         max_seqlen_k: Int32 | None = None,
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
+        if cutlass.const_expr(aux_data is None):
+            aux_data = AuxData()
         assert window_size_left is None and window_size_right is None, (
             "SM100 backward with head_dim=256 uses constructor-provided window sizes"
         )
