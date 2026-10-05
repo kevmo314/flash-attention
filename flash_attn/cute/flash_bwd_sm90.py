@@ -362,12 +362,14 @@ class FlashAttentionBackwardSm90:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_data: AuxData = AuxData(),
+        aux_data: Optional[AuxData] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        if const_expr(aux_data is None):
+            aux_data = AuxData()
         # For GQA (qhead_per_kvhead > 1), multiple Q heads accumulate into the same dK/dV,
         # so we need the float32 accum path + postprocess.
         # For varlen_k with qhead_per_kvhead == 1, we use ragged TMA tensors.
