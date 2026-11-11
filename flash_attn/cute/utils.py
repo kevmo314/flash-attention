@@ -25,6 +25,18 @@ class AuxData(NamedTuple):
     scalars: tuple | None = None
 
 
+def make_aux_data(tensors: tuple | list | None, scalars: tuple | None) -> Optional[AuxData]:
+    """AuxData for a kernel entry point, or None when there is nothing to pass.
+
+    An empty AuxData flattens to no JIT arguments, which the CuTe DSL warns
+    cannot be converted to a JitArgument. None is a compile-time constant, and
+    the entry points substitute AuxData() for it.
+    """
+    if tensors is None and scalars is None:
+        return None
+    return AuxData(tensors, scalars)
+
+
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
 POLY_EX2 = {

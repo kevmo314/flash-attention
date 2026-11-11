@@ -27,7 +27,7 @@ from flash_attn.cute.utils import (
 )
 from flash_attn.cute.mask import call_mask_mod
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import AuxData, make_aux_data
 
 
 class BlockSparsityKernel:
@@ -70,8 +70,10 @@ class BlockSparsityKernel:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        aux_data: AuxData = AuxData(),
+        aux_data: Optional[AuxData] = None,
     ):
+        if const_expr(aux_data is None):
+            aux_data = AuxData()
         mask_cnt, mask_idx, full_cnt, full_idx, mCuTotalMBlocks, mCuBlockIdxOffsets, *_ = (
             blocksparse_tensors
         )
@@ -521,7 +523,7 @@ def compute_block_sparsity(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            AuxData(cute_aux_tensors, aux_scalars),
+            make_aux_data(cute_aux_tensors, aux_scalars),
             options="--enable-tvm-ffi",
         )
 
@@ -543,7 +545,7 @@ def compute_block_sparsity(
             cu_seqlens_k,
             seqused_q,
             seqused_k,
-            AuxData(aux_tensors, aux_scalars),
+            make_aux_data(aux_tensors, aux_scalars),
         )
 
     return blocksparse_tensors_torch
