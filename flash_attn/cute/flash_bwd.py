@@ -392,12 +392,14 @@ class FlashAttentionBackwardSm80:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_data: AuxData = AuxData(),
+        aux_data: Optional[AuxData] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        if cutlass.const_expr(aux_data is None):
+            aux_data = AuxData()
         assert mdQ_semaphore is None and mdK_semaphore is None and mdV_semaphore is None, (
             "determinism not supported yet for Sm80"
         )

@@ -1685,7 +1685,7 @@ class FlashAttentionForwardSm100SwapAB:
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_data: AuxData = AuxData(),
+        aux_data: Optional[AuxData] = None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         tile_count_semaphore: Optional[cute.Tensor] = None,
         virtual_batch_idx_ptr: Optional[cute.Tensor] = None,
@@ -1698,6 +1698,8 @@ class FlashAttentionForwardSm100SwapAB:
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        if const_expr(aux_data is None):
+            aux_data = AuxData()
         # Compile-time guards (Python None / static rank / dtype).
         assert (mCuSeqlensQ is not None) == self.is_varlen_q
         for value in (
