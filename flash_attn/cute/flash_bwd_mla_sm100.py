@@ -7,6 +7,8 @@ from typing import Callable, Optional
 import cuda.bindings.driver as cuda
 
 import cutlass
+import cutlass.tensor_utils
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
 import cutlass.pipeline as pipeline
@@ -733,9 +735,9 @@ class FlashAttentionSparseMLABackwardSm100:
 
         # Prepare additional SMEM load layouts
         if const_expr(not self.recompute_P):
-            self.P_layout_major = cutlass.utils.LayoutEnum.from_tensor(mP)
+            self.P_layout_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mP)
         else:
-            self.P_layout_major = cutlass.utils.LayoutEnum.from_tensor(mdS)
+            self.P_layout_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mdS)
         self.sP_layout_staged = sm100_utils.make_smem_layout_epi(
             self.dtype, self.P_layout_major, self.tile_P, self.num_stages_P
         )
@@ -857,8 +859,8 @@ class FlashAttentionSparseMLABackwardSm100:
         # ==== TMA store ====
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()  
 
-        self.dS_layout_major = cutlass.utils.LayoutEnum.from_tensor(mdS)
-        self.dV_layout_major = cutlass.utils.LayoutEnum.from_tensor(mdV)
+        self.dS_layout_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mdS)
+        self.dV_layout_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mdV)
         # (tile_m, tile_n, dS_stages) = (nheads, 64, dS_stage)
         sdS_layout_staged = sm100_utils.make_smem_layout_epi(
             self.dtype, self.dS_layout_major, self.tile_dS, self.num_stages_dSt
@@ -1062,7 +1064,7 @@ class FlashAttentionSparseMLABackwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
 
         # ==== Allocate SMEM ====
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # ==== Prepare TMEM allocator ====
@@ -1070,7 +1072,7 @@ class FlashAttentionSparseMLABackwardSm100:
             barrier_id=int(NamedBarrierBwdSm100_MLA2CTA.TmemPtr),
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

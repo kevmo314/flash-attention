@@ -36,6 +36,8 @@ from typing import Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
 import cutlass
+import cutlass.tensor_utils
+import cutlass.memory
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
@@ -202,11 +204,11 @@ class dQdQvGemmKernel:
             mK = static_reshape(mK, self.head_dim_k)
 
         # ---- layout info ----
-        self.ds_major_mode = utils.LayoutEnum.from_tensor(mdS).mma_major_mode()
-        self.kv_major_mode = utils.LayoutEnum.from_tensor(mV).mma_major_mode()
-        self.dq_layout = utils.LayoutEnum.from_tensor(mdQv)
+        self.ds_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(mdS).mma_major_mode()
+        self.kv_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(mV).mma_major_mode()
+        self.dq_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mdQv)
         if const_expr(self.compute_dQ):
-            assert self.dq_layout == utils.LayoutEnum.from_tensor(mdQ)
+            assert self.dq_layout == cutlass.tensor_utils.LayoutEnum.from_tensor(mdQ)
 
         # ------------------------------------------------------------------ #
         # Setup attributes that depend on kernel inputs                      #
@@ -263,7 +265,7 @@ class dQdQvGemmKernel:
             )
 
         # ---- Device-specific attributes ----
-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
 
         self.num_tmem_alloc_cols = 512
 
@@ -500,7 +502,7 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         # Shared storage allocation                                          #
         # ------------------------------------------------------------------ #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # ------------------------------------------------------------------ #
@@ -576,7 +578,7 @@ class dQdQvGemmKernel:
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_ids)),
         )
         # ---- Tensor memory dealloc barrier init ----
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_ids[0],

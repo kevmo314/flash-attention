@@ -2,6 +2,7 @@ from functools import partial
 from typing import Callable, Optional, Tuple
 
 import cutlass
+import cutlass.memory
 import cutlass.cute as cute
 import torch
 from cutlass import Boolean, Int8, Int32, const_expr
@@ -146,7 +147,7 @@ class BlockSparsityKernel:
                 cute.struct.MemRange[cutlass.Int8, 2 * self.num_warps], 1024
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage, 16)
 
         reduction_buffer = storage.reduction_buffer_smem.get_tensor(

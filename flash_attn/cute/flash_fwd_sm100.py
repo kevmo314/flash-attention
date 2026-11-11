@@ -20,6 +20,8 @@ from functools import partial
 import cuda.bindings.driver as cuda
 
 import cutlass
+import cutlass.tensor_utils
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
@@ -29,7 +31,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_layout
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils, layout_utils
@@ -553,7 +555,7 @@ class FlashAttentionForwardSm100:
         q_major_mode = cute.nvgpu.OperandMajorMode.K
         k_major_mode = cute.nvgpu.OperandMajorMode.K
         v_major_mode = cute.nvgpu.OperandMajorMode.MN
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -1064,7 +1066,7 @@ class FlashAttentionForwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # TMEM handoffs span warp-role branches, so all waits and arrivals must be unaligned.
@@ -1078,7 +1080,7 @@ class FlashAttentionForwardSm100:
             ),
         )
         # Tensor memory dealloc barrier init
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

@@ -44,6 +44,8 @@ from typing import Callable, Optional
 import cuda.bindings.driver as cuda
 
 import cutlass
+import cutlass.tensor_utils
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
 from cutlass.cute import FastDivmodDivisor
@@ -319,12 +321,12 @@ class FlashAttentionMLAForward1CtaSm100:
         self.mma_tiler_QK = (self.cta_tile_m, self.tile_n, self.hdim)
         self.mma_tiler_QvV = (self.cta_tile_m, self.tile_n, self.hdimv // self.num_hdimv_splits)
         self.mma_tiler_PVt = (self.cta_tile_m, self.hdimv // self.num_hdimv_splits, self.tile_n)
-        self.major_mode_Q = tcgen05.OperandMajorMode.K
-        self.major_mode_Qvi = tcgen05.OperandMajorMode.K
-        self.major_mode_K = tcgen05.OperandMajorMode.K
-        self.major_mode_Vi = tcgen05.OperandMajorMode.K
-        self.major_mode_Vti = tcgen05.OperandMajorMode.MN
-        self.major_mode_P = tcgen05.OperandMajorMode.K
+        self.major_mode_Q = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Qvi = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_K = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Vi = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Vti = cute.nvgpu.OperandMajorMode.MN
+        self.major_mode_P = cute.nvgpu.OperandMajorMode.K
         self.operand_source_A = tcgen05.OperandSource.SMEM
         # Only the QK mma can take its A operand (Q) from TMEM; Qv and P stay in SMEM
         # (Qv would need 256 TMEM columns).
@@ -709,7 +711,7 @@ class FlashAttentionMLAForward1CtaSm100:
             else None
         )
 
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
 
         # (b, s_q, topk) -> (topk, s_q, b), or (total_q, topk) -> (topk, total_q)
         if const_expr(mIndexTopk is not None):
@@ -1139,7 +1141,7 @@ class FlashAttentionMLAForward1CtaSm100:
         )
 
         # ==== Allocate SMEM ====
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # ==== TMEM stuff ====
@@ -1147,7 +1149,7 @@ class FlashAttentionMLAForward1CtaSm100:
             barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.TmemPtr),
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

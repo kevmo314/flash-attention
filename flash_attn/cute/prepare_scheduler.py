@@ -6,6 +6,7 @@ import operator
 import torch
 import cuda.bindings.driver as cuda
 import cutlass
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass import Int32, const_expr, Float32
 from cutlass.cute import FastDivmodDivisorV2
@@ -232,7 +233,7 @@ class FlashPrepareScheduler:
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         total_blocks_smem = storage.total_blocks_smem.get_tensor((1,))
 

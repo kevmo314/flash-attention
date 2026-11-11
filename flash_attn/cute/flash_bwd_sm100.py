@@ -7,10 +7,12 @@ from functools import partial
 import cuda.bindings.driver as cuda
 
 import cutlass
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
-from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
+from cutlass.tensor_utils import LayoutEnum
+from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
@@ -1599,7 +1601,7 @@ class FlashAttentionBackwardSm100:
         )
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         dQ_cluster_full_mbar_ptr = storage.dQ_cluster_full_mbar_ptr.data_ptr()
@@ -1644,7 +1646,7 @@ class FlashAttentionBackwardSm100:
             num_threads=cute.arch.WARP_SIZE
             * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

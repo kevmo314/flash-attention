@@ -3,6 +3,7 @@ from typing import Callable, Optional
 import cuda.bindings.driver as cuda
 
 import cutlass
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
@@ -73,7 +74,7 @@ class CuSeqlensToBlocksKernel:
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         warp_block_count = storage.warp_block_count.get_tensor(cute.make_layout(self.num_warps))
         warp_split_count = storage.warp_split_count.get_tensor(cute.make_layout(self.num_warps))

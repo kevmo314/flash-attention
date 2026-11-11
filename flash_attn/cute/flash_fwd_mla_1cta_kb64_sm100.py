@@ -46,6 +46,7 @@ from typing import Callable, Optional
 import cuda.bindings.driver as cuda
 
 import cutlass
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
 import cutlass.pipeline as pipeline
@@ -509,7 +510,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             mQ_tma, mQv_tma = mQ, mQv
 
         # ==== MMAs (layout / descriptor providers of the .ws PTX helpers) ====
-        K, MN = tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN
+        K, MN = cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.MN
         make_mma = sm100_utils.make_trivial_tiled_mma
         # fmt: off
         # physical stage / rope tile layouts (what the gather writes): an M=64 N=64 K-major op
@@ -804,7 +805,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             cute.make_layout(self.cluster_shape_mnk), (tiled_mma_Sd.thr_id.shape,)
         )
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # ==== TMEM ====
@@ -812,7 +813,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
             barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.TmemPtr),
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
