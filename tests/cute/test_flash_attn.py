@@ -6,7 +6,10 @@ import os
 import random
 import re
 import gc
+from contextlib import contextmanager
+from dataclasses import replace
 from functools import wraps
+from unittest import mock
 
 import pytest
 import torch
@@ -18,7 +21,15 @@ try:
 except ImportError:
     apply_rotary_emb = None
 
+from decode_test_utils import require_swapab
 from flash_attn.cute.cache_utils import JITCache
+from flash_attn.cute.config import (
+    FwdConfig,
+    Sm100Registers,
+    derive_fwd_config,
+    select_fwd_config,
+    with_clc_scheduler,
+)
 from flash_attn.cute.testing import (
     check_dsink_vs_ref,
     check_tensor_vs_ref,
@@ -31,12 +42,15 @@ from flash_attn.cute.testing import (
     is_fake_mode,
 )
 from flash_attn.cute.interface import (
+    TensorwiseScales,
     flash_attn_func,
     flash_attn_varlen_func,
+    _get_device_arch,
     get_scheduler_metadata,
     _bwd_preprocess,
     _bwd_postprocess_convert,
     _flash_attn_fwd,
+    _flash_attn_fwd_combine,
     _flash_attn_bwd,
 )
 
@@ -76,12 +90,172 @@ TEST_BWD_ONLY = False
 VERBOSE = True
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 SplitKV heuristic")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_auto_splits_more_tiles_than_sms(monkeypatch):
+    """num_splits=0 asks for the heuristic; with more tiles than SMs it must pick one split."""
+    # The standard kernel's heuristic; SwapAB decode would otherwise take this call.
+    monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "standard")
+    torch.manual_seed(0)
+    q = torch.randn(256, 1, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(256, 2048, 16, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    out, _ = flash_attn_func(q, k, v, num_splits=0)
+    ref, _ = flash_attn_func(q, k, v, num_splits=1)
+    if is_fake_mode():
+        return
+    assert torch.equal(out, ref)
+
+
+@contextmanager
+def capture_selected_fwd_config():
+    """Record the config that _flash_attn_fwd selects."""
+    selected = {}
+
+    def capture(inputs):
+        selected["config"] = select_fwd_config(inputs)
+        selected["inputs"] = inputs
+        return selected["config"]
+
+    with mock.patch("flash_attn.cute.interface.select_fwd_config", side_effect=capture):
+        yield selected
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 CLC with 2CTA")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_clc_2cta_matches_default():
+    """CLC must assign both CTAs of a cluster the same m block."""
+
+    def clc_config(selected):
+        """Force CLC onto the selected default 2CTA config."""
+        config, inputs = selected["config"], selected["inputs"]
+        assert config.use_2cta_instrs and not config.use_clc_scheduler
+        return with_clc_scheduler(config, inputs, True)
+
+    torch.manual_seed(0)
+    # Dense Q and K use the non-varlen scheduler.
+    q_dense = torch.randn(2, 512, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k_dense = torch.randn_like(q_dense)
+    v_dense = torch.randn_like(q_dense)
+    with capture_selected_fwd_config() as selected:
+        dense_ref = _flash_attn_fwd(q_dense, k_dense, v_dense)[0]
+    dense_out = _flash_attn_fwd(q_dense, k_dense, v_dense, config=clc_config(selected))[0]
+    # Varlen K allows CLC with dense hd128 Q. 900 rows give 15 packed tiles per KV head,
+    # leaving the last cluster half full.
+    lens_k = [1500, 2600]
+    q = torch.randn(2, 900, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(lens_k), 4, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    cu_seqlens_k = torch.tensor([0, lens_k[0], sum(lens_k)], device="cuda", dtype=torch.int32)
+    kwargs = dict(cu_seqlens_k=cu_seqlens_k, max_seqlen_k=max(lens_k), pack_gqa=True)
+    with capture_selected_fwd_config() as selected:
+        ref = _flash_attn_fwd(q, k, v, **kwargs)[0]
+    out = _flash_attn_fwd(q, k, v, config=clc_config(selected), **kwargs)[0]
+    if is_fake_mode():
+        return
+    assert torch.equal(dense_out, dense_ref)
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 CLC")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_clc_lpt_global_reorders_only():
+    """lpt_global (NOTE [global LPT]) only reorders tiles: every row is written, bitwise as the
+    per-section order writes it."""
+    torch.manual_seed(0)
+    # 3 x 12 heads give one full L2 section of 32 heads and a partial one; 288 tiles.
+    q = torch.randn(3, 2048, 12, 128, device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    with capture_selected_fwd_config() as selected:
+        _flash_attn_fwd(q, k, v, causal=True)
+    config, inputs = selected["config"], selected["inputs"]
+    # Default on BF16 hd128 causal CLC cells (sm_100 and sm_103 families) with enough SMs.
+    if inputs.device_arch in (100, 103) and 288 <= 2.25 * inputs.num_sms:
+        assert config.use_clc_scheduler and config.lpt_global
+    config = derive_fwd_config(
+        config, inputs, use_clc_scheduler=True, is_static_persistent=False, lpt_global=True
+    )
+    outs = []
+    for lpt_global in (True, False):
+        out = torch.full_like(q, float("nan"))
+        lse = torch.full((3, 12, 2048), float("nan"), device="cuda", dtype=torch.float32)
+        _flash_attn_fwd(
+            q, k, v, causal=True, out=out, lse=lse, return_lse=True,
+            config=replace(config, lpt_global=lpt_global),
+        )
+        outs.append((out, lse))
+    if is_fake_mode():
+        return
+    (out, lse), (ref, ref_lse) = outs
+    assert not out.isnan().any() and not lse.isnan().any()
+    assert torch.equal(out, ref) and torch.equal(lse, ref_lse)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 forward work tiles")
+@pytest.mark.parametrize(
+    "use_tma_o,qhead_per_kvhead",
+    [(False, 1), (False, 3), (True, 1)],
+    ids=["corr_epi", "corr_epi_packed_gqa", "tma_o"],
+)
+@pytest.mark.parametrize("policy", ["grid", "static_persistent", "clc"])
+@pytest.mark.parametrize("q_stage", [1, 2])
+@pytest.mark.parametrize("use_2cta", [False, True], ids=["1cta", "2cta"])
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_work_tiles_cover_q(
+    causal, use_2cta, q_stage, policy, use_tma_o, qhead_per_kvhead
+):
+    """Each scheduling policy writes every valid Q row once (NOTE [SM100 forward work coordinates])."""
+    if causal and (use_2cta or policy == "static_persistent"):
+        pytest.skip("hd128 causal supports neither 2CTA nor static persistence")
+    if use_2cta and qhead_per_kvhead == 3:
+        pytest.skip("3-way packed GQA forces the correction epilogue but disables TMA Q")
+    torch.manual_seed(0)
+    # 1000 rows leave a partial last work tile; 4 * 32 heads give several waves of work tiles.
+    # 3 packed Q heads per KV head do not divide tile_m, so packed rows straddle work tiles.
+    batch, seqlen_q, seqlen_k, d = 4, 1000, 1024, 128
+    nheads, nheads_kv = (24, 8) if qhead_per_kvhead == 3 else (32, 32)
+    q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen_k, nheads_kv, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    with capture_selected_fwd_config() as selected:
+        _flash_attn_fwd(q, k, v, causal=causal)
+    # derive_fwd_config re-derives the dependent fields for the forced choices.
+    config = derive_fwd_config(
+        selected["config"], selected["inputs"], tile_m=128, tile_n=128, q_stage=q_stage,
+        pack_gqa=qhead_per_kvhead > 1, use_clc_scheduler=policy == "clc",
+        is_static_persistent=policy == "static_persistent", use_tma_o=use_tma_o,
+        use_s_ping_pong=False, num_splits=1, use_2cta_instrs=use_2cta,
+    )
+    # NaN sentinels expose rows that no CTA writes.
+    out = torch.full_like(q, float("nan"))
+    lse = torch.full((batch, nheads, seqlen_q), float("nan"), device="cuda", dtype=torch.float32)
+    _flash_attn_fwd(q, k, v, causal=causal, out=out, lse=lse, return_lse=True, config=config)
+    if is_fake_mode():
+        return
+    out_ref, _ = attention_ref(q, k, v, causal=causal)
+    out_pt, _ = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert not out.isnan().any() and not lse.isnan().any()
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
+    kr = repeat(k, "b s h d -> b s (h g) d", g=qhead_per_kvhead)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), kr.float()) / math.sqrt(d)
+    if causal:
+        q_idx = torch.arange(seqlen_q, device="cuda")[:, None] + seqlen_k - seqlen_q
+        scores.masked_fill_(torch.arange(seqlen_k, device="cuda")[None, :] > q_idx, float("-inf"))
+    torch.testing.assert_close(lse, scores.logsumexp(dim=-1), atol=1e-3, rtol=1e-4)
+
+
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
-def test_flash_attn_sm120_rejects_splitkv():
+@pytest.mark.parametrize("num_splits", [0, -1])
+def test_flash_attn_sm120_num_splits(num_splits):
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
+    out = flash_attn_func(q, k, v)
+    out_auto = flash_attn_func(q, k, v, num_splits=num_splits)
+    torch.testing.assert_close(out_auto, out)
+    with pytest.raises(ValueError, match="SM120 forward only supports num_splits=1"):
         flash_attn_func(q, k, v, num_splits=3)
 
 
@@ -414,6 +588,137 @@ def test_flash_attn_paged_non_tma_partial_loader_tile():
     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 runtime SplitKV")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_forced_split_config_reuses_specializations():
+    """Exact split counts must not enter the compile key."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 8, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2048, 8, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    config_2 = FwdConfig(
+        device_capacity=torch.cuda.get_device_capability()[0],
+        tile_m=128,
+        tile_n=128,
+        mma_pv_is_rs=False,
+        intra_wg_overlap=False,
+        q_stage=1,
+        pack_gqa=False,
+        use_clc_scheduler=False,
+        is_static_persistent=False,
+        use_tma_o=True,
+        use_s_ping_pong=False,
+        num_splits=2,
+        use_2cta_instrs=False,
+        registers=Sm100Registers(softmax=200, correction=64, other=48),
+        ex2_emu_freq=0,
+        ex2_emu_start_frg=0,
+        overlap_sO_sQ=False,
+        kv_stage=11,
+        sm_stats_cross_stage=False,
+    )
+    out_2 = _flash_attn_fwd(q, k, v, config=config_2)[0]
+    main_keys = set(_flash_attn_fwd.compile_cache.cache)
+    combine_keys = set(_flash_attn_fwd_combine.compile_cache.cache)
+    out_4 = _flash_attn_fwd(q, k, v, config=replace(config_2, num_splits=4))[0]
+    assert set(_flash_attn_fwd.compile_cache.cache) == main_keys
+    assert set(_flash_attn_fwd_combine.compile_cache.cache) == combine_keys
+    if is_fake_mode():
+        return
+    reference = attention_ref(q, k, v)[0].float()
+    torch.testing.assert_close(out_2.float(), reference, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(out_4.float(), reference, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.parametrize(
+    "arch,varlen,batch,seqlen_q,seqlen_k,nheads,nheads_kv,causal,expected",
+    [
+        # GB300 tuning (#2738): packed high-head varlen and dense causal short-K use CLC.
+        pytest.param(103, True, 3, 1366, 1366, 24, 6, True,
+                     {"pack_gqa": True, "use_clc_scheduler": True}, id="sm103-varlen-high-head-clc"),
+        pytest.param(103, False, 32, 17, 640, 24, 6, True,
+                     {"pack_gqa": True, "use_clc_scheduler": True}, id="sm103-dense-short-k-clc"),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_tuned_default_config_matches_reference(
+    arch, varlen, batch, seqlen_q, seqlen_k, nheads, nheads_kv, causal, expected
+):
+    if _get_device_arch() != arch:
+        pytest.skip(f"tuned rule targets sm_{arch}")
+    torch.manual_seed(0)
+    q = torch.randn(batch, seqlen_q, nheads, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen_k, nheads_kv, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q_in, k_in, v_in, kwargs = q, k, v, {}
+    if varlen:
+        assert seqlen_q == seqlen_k
+        cu_seqlens = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * seqlen_q
+        q_in, k_in, v_in = (t.flatten(0, 1) for t in (q, k, v))
+        kwargs = dict(
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens, max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k
+        )
+    with capture_selected_fwd_config() as selected:
+        out = _flash_attn_fwd(q_in, k_in, v_in, causal=causal, **kwargs)[0]
+    assert {name: getattr(selected["config"], name) for name in expected} == expected
+    if is_fake_mode():
+        return
+    reference = attention_ref(q, k, v, causal=causal)[0].float()
+    torch.testing.assert_close(out.view(reference.shape).float(), reference, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 explicit config metadata test")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_explicit_config_scheduler_metadata(monkeypatch):
+    """Explicit configs reject caller scheduler_metadata unless it is disabled."""
+    # The hd256 varlen 2CTA config is the case under test; CUDA 12 and FA_DISABLE_2CTA=1 turn 2CTA off.
+    monkeypatch.setattr("flash_attn.cute.utils._get_disable_2cta_default", lambda is_fwd=False: False)
+    lengths = [300, 300]
+    q = torch.randn(sum(lengths), 8, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    cu_seqlens = torch.tensor([0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32)
+    varlen = dict(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+    )
+    with capture_selected_fwd_config() as selected:
+        out = _flash_attn_fwd(q, k, v, **varlen)[0]
+    config = selected["config"]
+    # Active caller metadata excludes hd256 varlen 2CTA; disabled metadata must not.
+    assert config.use_2cta_instrs
+    metadata = get_scheduler_metadata(nheads=8, nheads_kv=8, headdim=256, num_splits=1, **varlen)
+    with pytest.raises(ValueError, match="cannot reuse caller-built scheduler_metadata"):
+        _flash_attn_fwd(q, k, v, scheduler_metadata=metadata, config=config, **varlen)
+    out_disabled = _flash_attn_fwd(
+        q, k, v, scheduler_metadata=metadata, disable_scheduler_metadata=True, config=config, **varlen
+    )[0]
+    if is_fake_mode():
+        return
+    assert torch.equal(out_disabled, out)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 varlen scheduler metadata test")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_scheduler_metadata_semaphore_follows_selected_scheduler():
+    """Varlen MHA selects the dynamic persistent scheduler, so its metadata has the semaphore."""
+    cu_seqlens = torch.tensor([0, 300, 500], device="cuda", dtype=torch.int32)
+    metadata = get_scheduler_metadata(
+        nheads=4,
+        nheads_kv=4,
+        headdim=128,
+        num_splits=1,
+        causal=True,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=300,
+        max_seqlen_k=300,
+    )
+    assert metadata.tile_count_semaphore is not None
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -494,17 +799,6 @@ def test_flash_attn_output(
         pytest.skip()
     if has_qv and local:
         pytest.xfail("has_qv: local not supported yet")
-    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
     device = "cuda"
     # set seed
     seed = 0
@@ -582,9 +876,9 @@ def test_flash_attn_output(
         else:
             learnable_sink_ref = None
             learnable_sink = None
-        # flash_attn_func exposes no descale kwargs (the kernel then uses descale=1),
+        # flash_attn_func runs without scales here (the kernel then uses descale=1),
         # so attention_ref must not apply descales either. Descale plumbing is
-        # exercised via _flash_attn_fwd directly.
+        # exercised by test_flash_attn_fp8_partial_descales.
         q_descale, k_descale, v_descale = None, None, None
         # FP8 is forward-only: the interface rejects fp8 inputs with requires_grad,
         # and the grad checks below are dtype-gated anyway.
@@ -648,7 +942,7 @@ def test_flash_attn_output(
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
         pack_gqa_vals = [True] if has_qv else [False, True, None] if not TEST_BWD_ONLY else [False]
-        # SplitKV is not supported for hdim >= 192, except the SM100 hd256 kernel
+        # SplitKV is not supported for hdim >= 192, except hd256 on SM100
         # pack_gqa_vals = [False]
         split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
@@ -658,21 +952,13 @@ def test_flash_attn_output(
                 continue
             if IS_SM100 and (d >= 192 and dv >= 192) and not (d == 256 and dv == 256):
                 continue
-            # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel does not support pack_gqa yet.
-            # pack_gqa=None means auto-enable for GQA/MQA (qhead_per_kvhead > 1)
-            # Remove this when support is added.
-            if d == 256 and IS_SM100:
-                if pack_gqa is True:
-                    continue
-                if pack_gqa is None and mha_type != "mha":
-                    continue
             out, lse = flash_attn_func(
                 q,
                 k,
                 v,
                 qv=qv,
                 causal=causal,
-                # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                # scales=TensorwiseScales(q_descale, k_descale, v_descale),
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
@@ -705,7 +991,7 @@ def test_flash_attn_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
+                or (IS_SM100 and d == 256 and dv == 256)
             )
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
@@ -1096,6 +1382,32 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
     )
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads,nheads_kv", [(4, 4), (8, 2)])
+def test_flash_attn_hd256_sm100_deterministic_backward(causal, nheads, nheads_kv):
+    """deterministic=True on the hd256 backward: gradients are bitwise equal across runs."""
+    if not IS_SM100:
+        pytest.skip("SM100-specific hd256 backward test")
+    torch.random.manual_seed(0)
+    seqlens = [1000, 77, 2048]
+    cu_seqlens = torch.tensor([0, *itertools.accumulate(seqlens)], device="cuda", dtype=torch.int32)
+    q = torch.randn(sum(seqlens), nheads, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(sum(seqlens), nheads_kv, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn_like(k, requires_grad=True)
+    dout = torch.randn_like(q)
+
+    grads = []
+    for _ in range(3):
+        out, _ = flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens), causal=causal, deterministic=True,
+        )
+        grads.append(torch.autograd.grad(out, (q, k, v), dout))
+    for run in grads[1:]:
+        for grad, grad_first in zip(run, grads[0]):
+            assert torch.equal(grad, grad_first)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("layout", ["padded", "transposed"])
@@ -1322,22 +1634,6 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if not unpad_q and unpad_kv:
-            pytest.skip(
-                "SM100 head_dim=256 2CTA kernel does not support varlen-packed K "
-                "without varlen Q (cu_seqlens_k requires cu_seqlens_q)"
-            )
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -1355,7 +1651,7 @@ def test_flash_attn_varlen_output(
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
     if d == 256:
-        dv_vals = [256]  # SM100 hd=256 2CTA kernel only supports dv=256
+        dv_vals = [256]  # (256, 256) is the only hd256 shape on SM100
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
@@ -1547,7 +1843,7 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
-        # SplitKV is not supported for hdim >= 192, except the SM100 hd256 kernel
+        # SplitKV is not supported for hdim >= 192, except hd256 on SM100
         split_hdim_ok = d < 192 or (IS_SM100 and d == 256 and dv == 256)
         num_splits_vals = [1, 3] if split_hdim_ok and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         precompute_metadata_vals = [False, True]
@@ -1559,14 +1855,6 @@ def test_flash_attn_varlen_output(
                 continue
             if precompute_metadata and is_fake_mode():
                 continue
-            # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel does not support pack_gqa yet.
-            # pack_gqa=None means auto-enable for GQA/MQA (qhead_per_kvhead > 1)
-            # Remove this when support is added.
-            if d == 256 and IS_SM100:
-                if pack_gqa is True:
-                    continue
-                if pack_gqa is None and mha_type != "mha":
-                    continue
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
                     max_seqlen_q=seqlen_q,
@@ -1598,8 +1886,7 @@ def test_flash_attn_varlen_output(
                     seqused_k=seqused_k if not unpad_kv else None,
                     causal=causal,
                     # qv=qv_unpad,
-                    # q_descale=q_descale,
-                    # k_descale=k_descale, v_descale=v_descale,
+                    # scales=TensorwiseScales(q_descale, k_descale, v_descale),
                     window_size=window_size,
                     # attention_chunk=attention_chunk,
                     learnable_sink=learnable_sink,
@@ -1646,7 +1933,7 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
+                or (IS_SM100 and d == 256 and dv == 256)
             )
             and not has_learnable_sink
             # and False
@@ -1943,6 +2230,76 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
         assert (x - x_ref).abs().max().item() <= 2 * (
             x_pt - x_ref
         ).abs().max().item() + atol, name
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="hd256 2CTA is SM100/SM110 only")
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("qhead_per_kvhead", [1, 6])
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_varlen_hd256_caller_metadata(causal, qhead_per_kvhead):
+    """hd256 varlen with caller-built scheduler metadata must match the metadata-free call.
+
+    get_scheduler_metadata() builds 1CTA tiles with the default pack_gqa, so the forward
+    must not switch to 2CTA (or drop PackGQA) when it reuses that metadata. Batch > 256 so
+    noncausal reuses the cu_total_m_blocks hint; causal reuses the tile semaphore.
+    """
+    device = "cuda"
+    torch.manual_seed(0)
+    batch_size, seqlen, nheads_kv, d = 300, 129, 2, 256
+    nheads = nheads_kv * qhead_per_kvhead
+    total = batch_size * seqlen
+    q = torch.randn(total, nheads, d, device=device, dtype=torch.bfloat16)
+    k = torch.randn(total, nheads_kv, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn(total, nheads_kv, d, device=device, dtype=torch.bfloat16)
+    cu_seqlens = torch.arange(0, total + 1, seqlen, device=device, dtype=torch.int32)
+    if is_fake_mode():
+        return
+    scheduler_metadata = get_scheduler_metadata(
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        nheads=nheads,
+        nheads_kv=nheads_kv,
+        headdim=d,
+        num_splits=1,
+        causal=causal,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+    )
+    outs = [
+        flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=seqlen,
+            max_seqlen_k=seqlen,
+            causal=causal,
+            num_splits=1,
+            scheduler_metadata=md,
+        )[0]
+        for md in (None, scheduler_metadata)
+    ]
+    out_ref, _ = attention_ref(
+        q.view(batch_size, seqlen, nheads, d),
+        k.view(batch_size, seqlen, nheads_kv, d),
+        v.view(batch_size, seqlen, nheads_kv, d),
+        causal=causal,
+    )
+    out_pt, _ = attention_ref(
+        q.view(batch_size, seqlen, nheads, d),
+        k.view(batch_size, seqlen, nheads_kv, d),
+        v.view(batch_size, seqlen, nheads_kv, d),
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    for out in outs:
+        assert (out.view_as(out_ref) - out_ref).abs().max().item() <= 2 * (
+            out_pt - out_ref
+        ).abs().max().item() + fwd_atol
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -2737,9 +3094,7 @@ def _run_fp8_paged_decode(q, k, v, page_size=128):
         page_table=page_table,
         softmax_scale=d**-0.5,
         causal=True,
-        q_descale=descale,
-        k_descale=descale,
-        v_descale=descale,
+        scales=TensorwiseScales(descale, descale, descale),
     )[0]
 
 
@@ -2752,16 +3107,386 @@ def _fp8_decode_reference(q, k, v):
     return torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v)
 
 
+def check_sm100_unused_v_cache(
+    monkeypatch,
+    d,
+    varlen,
+    causal,
+    dtype,
+    num_splits,
+    *,
+    seqlen_q=1,
+    disable_2cta=False,
+    nheads_kv=8,
+    dv=None,
+    v_layout="contiguous",
+    backend="standard",
+):
+    """Unused nonpaged V cache rows must not contribute NaNs to attention.
+
+    backend sets FLASH_ATTENTION_SM100_BACKEND: these checks target the standard kernel's
+    ragged V loads unless a test also runs them on SwapAB decode, which must then be selected.
+    """
+    from flash_attn.cute import utils
+
+    if DISABLE_SPLIT and num_splits > 1:
+        pytest.skip("SplitKV disabled by the test environment")
+    monkeypatch.setattr(utils, "_fa_disable_2cta_enabled", disable_2cta)
+    if backend == "swapab":
+        require_swapab(monkeypatch)
+    else:
+        monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", backend)
+    torch.manual_seed(42)
+    k_lengths = [32, 64, 96, 48, 128, 0, 193]
+    if v_layout == "broadcast_batch":
+        k_lengths = [73] * len(k_lengths)
+    batch_size, nheads, capacity = len(k_lengths), 8, 256
+    dv = d if dv is None else dv
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+    v_clean = torch.randn(
+        batch_size, capacity, nheads_kv, dv, device="cuda", dtype=dtype
+    )
+    if v_layout == "broadcast_batch":
+        v_clean = v_clean[:1].expand_as(v_clean).clone()
+    elif v_layout == "broadcast_head":
+        v_clean = v_clean[:, :, :1].expand_as(v_clean).clone()
+    elif v_layout == "broadcast_sequence":
+        v_clean = v_clean[:, :1].expand_as(v_clean).clone()
+    v_finite, v_nan, v_unused_tiles = [v_clean.clone() for _ in range(3)]
+    if not is_fake_mode():
+        for b, length in enumerate(k_lengths):
+            v_clean[b, length:] = 0
+            v_finite[b, length:] = 300
+            v_nan[b, length:] = float("nan")
+            v_unused_tiles[b, length:] = 0
+            first_unused_tile = math.ceil(length / 128) * 128
+            v_unused_tiles[b, first_unused_tile:] = float("nan")
+    seqused_k = torch.tensor(k_lengths, device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.arange(
+        0, (batch_size + 1) * capacity, capacity, device="cuda", dtype=torch.int32
+    )
+
+    def run(value):
+        if v_layout == "strided":
+            storage = torch.empty(
+                batch_size, capacity, 2 * nheads_kv, dv, device="cuda", dtype=dtype
+            )
+            storage[:, :, ::2].copy_(value)
+            value = storage[:, :, ::2]
+        elif v_layout == "batch_transpose":
+            value = value.transpose(0, 1).contiguous().transpose(0, 1)
+        elif v_layout == "broadcast_batch":
+            value = value[:1].expand_as(value)
+        elif v_layout == "broadcast_head":
+            value = value[:, :, :1].expand_as(value)
+        elif v_layout == "broadcast_sequence":
+            value = value[:, :1].expand_as(value)
+        out, lse = flash_attn_varlen_func(
+            q.flatten(0, 1) if varlen else q,
+            k.flatten(0, 1) if varlen else k,
+            value.flatten(0, 1) if varlen else value,
+            cu_seqlens_q=cu_seqlens_q if varlen else None,
+            cu_seqlens_k=cu_seqlens_k if varlen else None,
+            seqused_k=seqused_k,
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=capacity,
+            causal=causal,
+            num_splits=num_splits,
+            return_lse=True,
+        )
+        if varlen:
+            out = out.reshape(batch_size, seqlen_q, nheads, dv)
+            lse = lse.reshape(nheads, batch_size, seqlen_q).permute(1, 0, 2)
+        return out, lse
+
+    # Issue every selected kernel variant before the FakeTensor early return.
+    results = [run(value) for value in (v_clean, v_finite, v_nan, v_unused_tiles)]
+    if is_fake_mode():
+        return
+
+    key_mask = (
+        torch.arange(capacity, device="cuda")[None, :]
+        < torch.tensor(k_lengths, device="cuda")[:, None]
+    )
+    reference, _ = attention_ref(
+        q.double(),
+        k.double(),
+        v_clean.double(),
+        key_padding_mask=key_mask,
+        causal=causal,
+        upcast=False,
+    )
+    eager, _ = attention_ref(
+        q,
+        k,
+        v_clean,
+        key_padding_mask=key_mask,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+    scores = torch.einsum(
+        "bqhd,bkhd->bhqk",
+        q.double() * d**-0.5,
+        k.double().repeat_interleave(nheads // nheads_kv, dim=2),
+    )
+    scores.masked_fill_(~key_mask[:, None, None, :], float("-inf"))
+    if causal:
+        q_positions = torch.arange(seqlen_q, device="cuda")[None, None, :, None]
+        k_positions = torch.arange(capacity, device="cuda")[None, None, None, :]
+        lengths = torch.tensor(k_lengths, device="cuda")[:, None, None, None]
+        scores.masked_fill_(
+            k_positions > q_positions + lengths - seqlen_q, float("-inf")
+        )
+    lse_ref = torch.logsumexp(scores, dim=-1)
+    finite_lse = torch.isfinite(lse_ref)
+    empty_rows = ~finite_lse.permute(0, 2, 1)
+    rounding = 2 * torch.finfo(dtype).eps * reference.abs()
+    for out, lse in results:
+        assert out.isfinite().all()
+        check_tensor_vs_ref(
+            "out", out.double(), reference, eager.double(), atol=rounding.max().item()
+        )
+        assert (out.double() - reference).abs().mean() <= (
+            2 * (eager.double() - reference).abs().mean() + rounding.mean()
+        )
+        assert torch.count_nonzero(out[empty_rows]) == 0
+        assert torch.equal(torch.isneginf(lse), torch.isneginf(lse_ref))
+        assert lse[finite_lse].isfinite().all()
+        assert torch.allclose(
+            lse[finite_lse].double(), lse_ref[finite_lse], atol=1e-5, rtol=1e-5
+        )
+    for out, lse in results[1:]:
+        assert torch.equal(out, results[0][0])
+        assert torch.equal(lse, results[0][1])
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_splits", [1, 3])
+@pytest.mark.parametrize("nheads_kv", [8, 2, 1])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache(
+    monkeypatch, d, varlen, causal, dtype, num_splits, nheads_kv
+):
+    check_sm100_unused_v_cache(
+        monkeypatch, d, varlen, causal, dtype, num_splits, nheads_kv=nheads_kv
+    )
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "varlen,causal,num_splits,disable_2cta",
+    [
+        (False, False, 1, False),  # Sq=257 enables the dense D128 2CTA route.
+        (False, False, 1, True),
+        (False, True, 1, False),
+        (False, True, 3, False),
+        (True, False, 1, False),
+        (True, True, 3, False),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_edges(
+    monkeypatch, dtype, varlen, causal, num_splits, disable_2cta
+):
+    check_sm100_unused_v_cache(
+        monkeypatch,
+        128,
+        varlen,
+        causal,
+        dtype,
+        num_splits,
+        seqlen_q=257,
+        disable_2cta=disable_2cta,
+    )
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "d,dv", [(128, 8), (128, 24), (128, 80), (192, 128), (256, 256)]
+)
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_dimensions(monkeypatch, dtype, d, dv, varlen):
+    check_sm100_unused_v_cache(monkeypatch, d, varlen, False, dtype, 1, dv=dv)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# Dense-Q layouts also run on SwapAB decode, which has its own bounded V descriptor; it does
+# not take cu_seqlens_k.
+@pytest.mark.parametrize(
+    "varlen,v_layout,backend",
+    [
+        (varlen, v_layout, backend)
+        for varlen, v_layout in [
+            (False, "strided"),
+            (True, "strided"),
+            (False, "batch_transpose"),
+            (False, "broadcast_batch"),
+            (False, "broadcast_head"),
+            (False, "broadcast_sequence"),
+        ]
+        for backend in (["standard"] if varlen else ["standard", "swapab"])
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_layouts(monkeypatch, dtype, varlen, v_layout, backend):
+    if backend == "swapab" and not IS_SM100:
+        pytest.skip("SwapAB decode is SM100/SM103-only")
+    check_sm100_unused_v_cache(
+        monkeypatch, 128, varlen, False, dtype, 1, v_layout=v_layout, backend=backend
+    )
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_packed_boundary(dtype):
+    # No seqused_k: NaNs in sequence 1 are valid there but must not leak into
+    # sequence 0's partially filled last tile through a packed TMA load.
+    q = torch.randn(2, 8, 64, device="cuda", dtype=dtype)
+    k = torch.randn(96, 8, 64, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    poisoned = v.clone()
+    poisoned[32:] = float("nan")
+    cu_q = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 32, 96], device="cuda", dtype=torch.int32)
+    outputs = [
+        flash_attn_varlen_func(
+            q,
+            k,
+            value,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=1,
+            max_seqlen_k=64,
+            num_splits=1,
+            return_lse=True,
+        )
+        for value in (v, poisoned)
+    ]
+    if is_fake_mode():
+        return
+    clean, dirty = outputs
+    assert clean[0].isfinite().all()
+    assert torch.equal(clean[0][0], dirty[0][0])
+    assert torch.isnan(dirty[0][1]).all()
+    assert torch.equal(clean[1], dirty[1])
+    reference, _ = attention_ref(
+        q[:1].unsqueeze(0).double(),
+        k[:32].unsqueeze(0).double(),
+        v[:32].unsqueeze(0).double(),
+        upcast=False,
+    )
+    low_reference, _ = attention_ref(
+        q[:1].unsqueeze(0),
+        k[:32].unsqueeze(0),
+        v[:32].unsqueeze(0),
+        upcast=False,
+        reorder_ops=True,
+    )
+    check_tensor_vs_ref(
+        "out",
+        dirty[0][:1].unsqueeze(0).double(),
+        reference,
+        low_reference.double(),
+        atol=2 * torch.finfo(dtype).eps * reference.abs().max().item(),
+    )
+    for b, (start, end) in enumerate(((0, 32), (32, 96))):
+        scores = torch.einsum("hd,khd->hk", q[b].double() / 8, k[start:end].double())
+        assert torch.allclose(
+            dirty[1][:, b].double(), scores.logsumexp(-1), atol=1e-5, rtol=1e-5
+        )
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 nonpaged V cache")
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_unused_v_cache_fp8(dtype, varlen):
+    q = torch.randn(2, 1, 8, 64, device="cuda").to(dtype)
+    k = torch.randn(2, 128, 8, 64, device="cuda").to(dtype)
+    v = torch.randn(2, 128, 8, 64, device="cuda")
+    v[:, 73:] = 0
+    poisoned = v.clone()
+    poisoned[:, 73:] = float("nan")
+    used = torch.full((2,), 73, device="cuda", dtype=torch.int32)
+    cu_q = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+    outputs = [
+        flash_attn_varlen_func(
+            q.flatten(0, 1) if varlen else q,
+            k.flatten(0, 1) if varlen else k,
+            value.to(dtype).flatten(0, 1) if varlen else value.to(dtype),
+            cu_seqlens_q=cu_q if varlen else None,
+            cu_seqlens_k=cu_k if varlen else None,
+            seqused_k=used,
+            max_seqlen_q=1,
+            max_seqlen_k=128,
+            num_splits=1,
+            return_lse=True,
+        )
+        for value in (v, poisoned)
+    ]
+    if is_fake_mode():
+        return
+    assert outputs[0][0].isfinite().all()
+    assert torch.equal(outputs[0][0], outputs[1][0])
+    assert torch.equal(outputs[0][1], outputs[1][1])
+    reference, _ = attention_ref(
+        q.double(), k[:, :73].double(), v.to(dtype)[:, :73].double(), upcast=False
+    )
+    low_reference, _ = attention_ref(
+        q.float(),
+        k[:, :73].float(),
+        v.to(dtype)[:, :73].float(),
+        upcast=False,
+        intermediate_dtype=dtype,
+    )
+    check_tensor_vs_ref(
+        "out",
+        outputs[0][0].reshape_as(reference).double(),
+        reference,
+        low_reference.double(),
+        atol=2 * torch.finfo(torch.bfloat16).eps * reference.abs().max().item(),
+    )
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.double() / 8, k[:, :73].double())
+    lse = outputs[0][1].reshape(8, 2, 1).permute(1, 0, 2) if varlen else outputs[0][1]
+    assert torch.allclose(lse.double(), scores.logsumexp(-1), atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.skipif(not IS_SM100, reason="SM100 paged KV (TMA pages)")
-@pytest.mark.parametrize("d, page_size", [(128, 128), (64, 128), (128, 64)])
+# Pages of 128 tokens also run on SwapAB decode; it does not support 64-token pages.
+@pytest.mark.parametrize(
+    "d, page_size, backend",
+    [(128, 128, "standard"), (128, 128, "swapab"), (64, 128, "standard"), (64, 128, "swapab"),
+     (128, 64, "standard")],
+)
 @pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("padding", ["unused_page_nan", "tail_finite_garbage"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_padding_contract(d, page_size, num_splits, padding):
+def test_flash_attn_paged_padding_contract(
+    d, page_size, backend, num_splits, padding, monkeypatch
+):
     """The paged-KV padding contract (see test_flash_attn_mla_paged_padding_contract): rows past
     seqused_k in a partially used page may hold finite garbage; pages an entry does not use may
     hold NaN, including the one a seqused_k = 0 entry's fully masked dummy tile loads. The output
     equals the run with zero padding, bitwise, and is 0 with LSE = -inf for empty entries."""
+    if backend == "swapab":
+        require_swapab(monkeypatch)
+    else:
+        monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", backend)
     device, dtype = "cuda", torch.bfloat16
     k_lens = [70, 0, 130, 0]
     b, h, h_kv, cap = len(k_lens), 8, 2, 256
@@ -2854,9 +3579,9 @@ def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
 @pytest.mark.parametrize("present", ["q", "k", "v", "qk", "qv", "kv"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_partial_descales(present):
-    """Any subset of q / k / v descales: a missing one is 1. The partial DescaleTensors must
-    keep each member in its own slot across the kernel boundary (bitwise equal to passing
-    ones for the missing members)."""
+    """Any subset of q / k / v descales: a missing one is 1. flash_attn_func must forward
+    scales, and the partial DescaleTensors must keep each member in its own slot across the
+    kernel boundary (bitwise equal to passing ones for the missing members)."""
     torch.manual_seed(0)
     batch_size, seqlen, nheads, nheads_kv, d = 2, 192, 4, 2, 128
     q, k, v = [
@@ -2865,12 +3590,12 @@ def test_flash_attn_fp8_partial_descales(present):
     ]
     descales = {name: torch.rand(batch_size, nheads_kv, device="cuda") + 0.5 for name in "qkv"}
     ones = torch.ones(batch_size, nheads_kv, device="cuda")
-    out = _flash_attn_fwd(
-        q, k, v, causal=True, **{f"{n}_descale": descales[n] for n in present}
-    )[0]
+    out, _ = flash_attn_func(
+        q, k, v, causal=True, scales=TensorwiseScales(**{n: descales[n] for n in present})
+    )
     out_ref = _flash_attn_fwd(
         q, k, v, causal=True,
-        **{f"{n}_descale": descales[n] if n in present else ones for n in "qkv"},
+        scales=TensorwiseScales(*(descales[n] if n in present else ones for n in "qkv")),
     )[0]
     if is_fake_mode():
         return
@@ -2933,7 +3658,7 @@ def test_flash_attn_paged_deepseek(seqlen_q, page_size):
 @pytest.mark.parametrize("seqlen_q", [128, 512, 2048])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd256_sm100_tma(seqlen_q, num_splits):
-    """TMA paged KV in the SM100 hd256 2CTA forward kernel.
+    """TMA paged KV in the SM100 hd256 forward.
 
     Verifies paged KV (page_table + TMA) matches the non-paged varlen reference
     and is deterministic across runs. page_size must equal tile_n=128.
@@ -2978,7 +3703,7 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q, num_splits):
         batch_size, num_pages_per_seq
     )
 
-    # Paged via hd256 2CTA TMA paged path — run twice for determinism.
+    # Paged via the TMA paged path — run twice for determinism.
     out_paged_0, _ = flash_attn_varlen_func(
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
@@ -3006,12 +3731,7 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q, num_splits):
 @pytest.mark.parametrize("nheads_kv", [2, 4, 8])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
-    """TMA paged KV for SM100 hd256 2CTA with GQA (nheads_q > nheads_kv).
-
-    Exercises the head_kv_coord derivation for qhead_per_kvhead > 1 — the MHA
-    test passes by coincidence since modulo and integer division agree when
-    qhead_per_kvhead == 1.
-    """
+    """Paged GQA must select the same KV head as the dense reference."""
     if not IS_SM100:
         pytest.skip("SM100-specific paged hd256 test")
     device = "cuda"
@@ -3066,19 +3786,15 @@ def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
     )
 
 
+@pytest.mark.parametrize("head_dim", [128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_hd256_sm100_tma_shuffled():
-    """TMA paged KV for SM100 hd256 2CTA with a non-identity (shuffled) page_table.
-
-    An identity page_table passes even if the kernel ignores it. This test
-    shuffles physical pages so a kernel that bypasses page_table would silently
-    read wrong data, proving the remapping path is exercised.
-    """
+def test_flash_attn_paged_sm100_tma_capacity(head_dim):
+    """Paged KV remaps shuffled pages and attends full capacity without seqused_k."""
     if not IS_SM100:
-        pytest.skip("SM100-specific paged hd256 test")
+        pytest.skip("SM100-specific paged KV test")
     device = "cuda"
     dtype = torch.bfloat16
-    d = 256
+    d = head_dim
     batch_size = 2
     nheads = 16
     nheads_kv = 16
@@ -3120,7 +3836,7 @@ def test_flash_attn_paged_hd256_sm100_tma_shuffled():
     out_paged, _ = flash_attn_varlen_func(
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
-        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q // 2,
         page_table=page_table,
     )
 
@@ -3138,7 +3854,8 @@ def test_flash_attn_paged_hd256_sm100_tma_shuffled():
 @pytest.mark.parametrize("max_seqlen_k_mode", ["batch_max", "page_aligned"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q, num_splits):
-    """Check paged seqused_k against dense varlen for batch-max and capacity extents."""
+    """Check paged seqused_k and dense varlen against the fp32 reference for batch-max and
+    capacity extents."""
     if not IS_SM100:
         pytest.skip("SM100-specific paged hd256 test")
     device = "cuda"
@@ -3242,67 +3959,30 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q,
     assert out_paged.abs().max().item() < 10.0, (
         "Paged seqused_k output has poison-scale magnitudes: KV past seqused_k leaked"
     )
-    # SplitKV rounds the fp32 combine to bf16 once more than the unsplit reference.
-    atol = 1e-3 if num_splits == 1 else 4e-3
-    assert torch.allclose(out_paged, out_ref, atol=atol, rtol=1e-3), (
-        "Paged seqused_k output does not match the dense varlen reference"
+    # Paged and dense varlen may run different kernels (SM100 SwapAB decode for seqlen_q=1), so
+    # each is checked against the fp32 reference over the used tokens.
+    max_used = max(seqused_k_list)
+    k_pad = torch.zeros(batch_size, max_used, nheads_kv, d, device=device, dtype=dtype)
+    v_pad = torch.zeros_like(k_pad)
+    for b, used in enumerate(seqused_k_list):
+        k_pad[b, :used] = k[k_offsets[b] : k_offsets[b + 1]]
+        v_pad[b, :used] = v[k_offsets[b] : k_offsets[b + 1]]
+    key_padding_mask = (
+        torch.arange(max_used, device=device)[None, :] < seqused_k[:, None]
     )
+    q_pad = q.reshape(batch_size, seqlen_q, nheads, d)
+    fp32_ref, _ = attention_ref(
+        q_pad, k_pad, v_pad, key_padding_mask=key_padding_mask, causal=True
+    )
+    pt_ref, _ = attention_ref(
+        q_pad, k_pad, v_pad, key_padding_mask=key_padding_mask, causal=True,
+        upcast=False, reorder_ops=True,
+    )
+    for name, out in (("paged seqused_k", out_paged), ("dense varlen", out_ref)):
+        check_tensor_vs_ref(name, out.reshape_as(fp32_ref).float(), fp32_ref, pt_ref.float())
     assert torch.equal(out_full_seqused, out_no_seqused), (
         "seqused_k equal to the allocated length must match the non-seqused path"
     )
-
-
-@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_hd256_sm100_tma_contract_guards():
-    """The two paged-KV contract guards of the SM100 hd256 2CTA forward kernel.
-
-    The interface widens ``max_seqlen_k`` to the enclosing page and narrows the
-    ``page_table`` to match, which is only well defined when (a) the table
-    actually covers the requested extent and (b) something bounds each sequence
-    at its true length once the extent is rounded up.
-    """
-    if not IS_SM100:
-        pytest.skip("SM100-specific paged hd256 test")
-    device = "cuda"
-    dtype = torch.bfloat16
-    d = 256
-    nheads = 8
-    nheads_kv = 8
-    page_size = 128
-    seqlen_q = 1
-    batch_size = 2
-    num_pages_per_seq = 2
-    total_pages = batch_size * num_pages_per_seq
-
-    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
-    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
-    k_paged = torch.randn(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
-    v_paged = torch.randn_like(k_paged)
-    page_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(
-        batch_size, num_pages_per_seq
-    )
-    seqused_k = torch.full((batch_size,), 200, dtype=torch.int32, device=device)
-
-    # (a) page_table narrower than the requested extent needs.
-    with pytest.raises(AssertionError, match="page_table to cover max_seqlen_k"):
-        flash_attn_varlen_func(
-            q, k_paged, v_paged,
-            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
-            max_seqlen_q=seqlen_q, max_seqlen_k=num_pages_per_seq * page_size + 1,
-            page_table=page_table,
-            seqused_k=seqused_k,
-            causal=True,
-        )
-
-    # (b) extent that needs rounding, with nothing bounding the true lengths.
-    with pytest.raises(AssertionError, match="rounds max_seqlen_k up"):
-        flash_attn_varlen_func(
-            q, k_paged, v_paged,
-            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
-            max_seqlen_q=seqlen_q, max_seqlen_k=page_size + 1,
-            page_table=page_table,
-            causal=True,
-        )
 
 
 @pytest.mark.parametrize("head_dim", [4, 148, 288])
@@ -3745,3 +4425,401 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
     )
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 backward K/V tail zero-fill")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads_kv", [8, 2])
+@pytest.mark.parametrize("disable_2cta", [False, True])
+@pytest.mark.parametrize("varlen", [True, False])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_bwd_unused_kv_tail(
+    monkeypatch, dtype, d, causal, nheads_kv, disable_2cta, varlen
+):
+    """K/V rows past seqused_k must not reach dQ/dK/dV, in the packed (cu_seqlens_k) and the
+    dense (batch, seqlen, heads, d) layout.
+
+    The backward is KV-stationary: dP = dO @ V^T and dQ = dS @ K read whole K/V tiles, and the
+    masked dS is exactly zero past the sequence end, but 0 * NaN = NaN unless the K/V TMA loads
+    are bounded by the logical sequence length. The backward kernel is driven directly from a
+    clean forward so the check does not depend on the forward's own handling of the V tail.
+    disable_2cta covers both the 1-CTA K/V loads and the 2-CTA transposed-K (Kt) load.
+    """
+    from flash_attn.cute import utils
+
+    monkeypatch.setattr(utils, "_fa_disable_2cta_enabled", disable_2cta)
+    torch.manual_seed(0)
+    nheads = 8
+    lengths = [100, 256, 37, 200, 129]
+    batch, capacity = len(lengths), 256
+    seqused_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    if varlen:
+        q = torch.randn(sum(lengths), nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        cu_seqlens_q = torch.tensor(
+            [0] + list(itertools.accumulate(lengths)), device="cuda", dtype=torch.int32
+        )
+        cu_seqlens_k = torch.arange(
+            0, (batch + 1) * capacity, capacity, device="cuda", dtype=torch.int32
+        )
+        kwargs = dict(
+            causal=causal,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
+            max_seqlen_q=max(lengths),
+            max_seqlen_k=capacity,
+        )
+    else:
+        seqlen_q = 128
+        q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(batch, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn(batch, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        kwargs = dict(
+            causal=causal, seqused_k=seqused_k, max_seqlen_q=seqlen_q, max_seqlen_k=capacity
+        )
+    out, lse = flash_attn_varlen_func(q, k, v, return_lse=True, **kwargs)
+    dout = torch.randn_like(out)
+
+    def backward(k_in, v_in):
+        dq, dk, dv = _flash_attn_bwd(q, k_in, v_in, out, dout, lse, **kwargs)[:3]
+        return dq, dk, dv
+
+    # The poisoned runs below reuse exactly these kernels, so this is the whole compile set.
+    ref = backward(k, v)
+    if is_fake_mode():
+        return
+
+    valid = torch.zeros(batch, capacity, dtype=torch.bool, device="cuda")
+    for b, length in enumerate(lengths):
+        valid[b, :length] = True
+    if varlen:
+        valid = valid.flatten()
+    # dQ and the GQA dK/dV go through fp32 reduce-adds whose order is not fixed, so the clean
+    # and poisoned runs can differ by an ulp; a NaN tail that leaks shows up as NaN, not as ulps.
+    eps = torch.finfo(dtype).eps
+    for poison in ("k", "v", "kv"):
+        k_nan, v_nan = k.clone(), v.clone()
+        if "k" in poison:
+            k_nan[~valid] = float("nan")
+        if "v" in poison:
+            v_nan[~valid] = float("nan")
+        dq, dk, dv = backward(k_nan, v_nan)
+        for name, got, want in zip(("dq", "dk", "dv"), (dq, dk, dv), ref):
+            if name != "dq":
+                # dK/dV rows past seqused_k are never written; compare the valid rows only.
+                got, want = got[valid], want[valid]
+            assert got.isfinite().all(), f"{poison}: {name} has NaN/Inf"
+            torch.testing.assert_close(
+                got, want, atol=4 * eps * want.abs().max().item(), rtol=4 * eps
+            )
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 backward K/V tail zero-fill")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads_kv", [8, 2])
+@pytest.mark.parametrize("varlen", [True, False])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_bwd_unused_kv_tail(dtype, d, causal, nheads_kv, varlen):
+    """K/V rows past seqused_k must not reach dQ/dK/dV, in the packed (cu_seqlens_k) and the
+    dense (batch, seqlen, heads, d) layout.
+
+    The backward is KV-stationary: dP = dO @ V^T and dQ = dS @ K read whole K/V tiles, and the
+    masked dS is exactly zero past the sequence end, but 0 * NaN = NaN unless the K/V TMA loads
+    are bounded by the logical sequence length. The backward kernel is driven directly from a
+    clean forward so the check does not depend on the forward's own handling of the V tail.
+    """
+    torch.manual_seed(0)
+    nheads = 8
+    lengths = [100, 256, 37, 200, 129]
+    batch, capacity = len(lengths), 256
+    seqused_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    if varlen:
+        q = torch.randn(sum(lengths), nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        cu_seqlens_q = torch.tensor(
+            [0] + list(itertools.accumulate(lengths)), device="cuda", dtype=torch.int32
+        )
+        cu_seqlens_k = torch.arange(
+            0, (batch + 1) * capacity, capacity, device="cuda", dtype=torch.int32
+        )
+        kwargs = {
+            "causal": causal,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "seqused_k": seqused_k,
+            "max_seqlen_q": max(lengths),
+            "max_seqlen_k": capacity,
+        }
+    else:
+        seqlen_q = 128
+        q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(batch, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn(batch, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        kwargs = {
+            "causal": causal,
+            "seqused_k": seqused_k,
+            "max_seqlen_q": seqlen_q,
+            "max_seqlen_k": capacity,
+        }
+    out, lse = flash_attn_varlen_func(q, k, v, return_lse=True, **kwargs)
+    dout = torch.randn_like(out)
+
+    def backward(k_in, v_in):
+        dq, dk, dv = _flash_attn_bwd(q, k_in, v_in, out, dout, lse, **kwargs)[:3]
+        return dq, dk, dv
+
+    # The poisoned runs below reuse exactly these kernels, so this is the whole compile set.
+    ref = backward(k, v)
+    if is_fake_mode():
+        return
+
+    valid = torch.zeros(batch, capacity, dtype=torch.bool, device="cuda")
+    for b, length in enumerate(lengths):
+        valid[b, :length] = True
+    if varlen:
+        valid = valid.flatten()
+    # dQ and the GQA dK/dV go through fp32 reduce-adds whose order is not fixed, so the clean
+    # and poisoned runs can differ by an ulp; a NaN tail that leaks shows up as NaN, not as ulps.
+    eps = torch.finfo(dtype).eps
+    for poison in ("k", "v", "kv"):
+        k_nan, v_nan = k.clone(), v.clone()
+        if "k" in poison:
+            k_nan[~valid] = float("nan")
+        if "v" in poison:
+            v_nan[~valid] = float("nan")
+        dq, dk, dv = backward(k_nan, v_nan)
+        for name, got, want in zip(("dq", "dk", "dv"), (dq, dk, dv), ref):
+            if name != "dq":
+                # dK/dV rows past seqused_k are never written; compare the valid rows only.
+                got, want = got[valid], want[valid]
+            assert got.isfinite().all(), f"{poison}: {name} has NaN/Inf"
+            torch.testing.assert_close(
+                got, want, atol=4 * eps * want.abs().max().item(), rtol=4 * eps
+            )
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 forward V tail zero-fill")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads_kv", [8, 2])
+@pytest.mark.parametrize("varlen", [True, False])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_fwd_unused_v_tail(dtype, d, causal, nheads_kv, varlen):
+    """V rows past seqused_k must not reach the output, in the packed (cu_seqlens_k) and the
+    dense (batch, seqlen, heads, d) layout.
+
+    Masking makes P exactly zero past the sequence end, but 0 * NaN = NaN in O = P @ V unless
+    the V TMA load is bounded by the logical sequence length. With the bound, the tail is
+    zero-filled by TMA, so a NaN tail and a zero tail give bitwise identical outputs.
+    """
+    torch.manual_seed(0)
+    nheads = 8
+    lengths = [100, 256, 37, 200, 129]
+    batch, capacity = len(lengths), 256
+    seqused_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    if varlen:
+        q = torch.randn(sum(lengths), nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn(batch * capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        cu_seqlens_q = torch.tensor(
+            [0] + list(itertools.accumulate(lengths)), device="cuda", dtype=torch.int32
+        )
+        cu_seqlens_k = torch.arange(
+            0, (batch + 1) * capacity, capacity, device="cuda", dtype=torch.int32
+        )
+        kwargs = {
+            "causal": causal,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "seqused_k": seqused_k,
+            "max_seqlen_q": max(lengths),
+            "max_seqlen_k": capacity,
+        }
+    else:
+        seqlen_q = 128
+        q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=dtype)
+        k = torch.randn(batch, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn(batch, capacity, nheads_kv, d, device="cuda", dtype=dtype)
+        kwargs = {
+            "causal": causal,
+            "seqused_k": seqused_k,
+            "max_seqlen_q": seqlen_q,
+            "max_seqlen_k": capacity,
+        }
+    valid = torch.zeros(batch, capacity, dtype=torch.bool, device="cuda")
+    for b, length in enumerate(lengths):
+        valid[b, :length] = True
+    if varlen:
+        valid = valid.flatten()
+    v_zero = v.clone()
+    v_zero[~valid] = 0
+    # The poisoned run below reuses exactly this kernel, so this is the whole compile set.
+    ref = flash_attn_varlen_func(q, k, v_zero, **kwargs)[0]
+    if is_fake_mode():
+        return
+
+    v_nan = v.clone()
+    v_nan[~valid] = float("nan")
+    out = flash_attn_varlen_func(q, k, v_nan, **kwargs)[0]
+    assert out.isfinite().all(), "out has NaN/Inf"
+    assert torch.equal(out, ref)
+
+
+# Regression tests for #3068: ragged K/V TMA loads must stay inside the tensor (the
+# per-CTA descriptor rewrite), the rewritten descriptor must be acquired on every
+# producer path, and the descriptor workspace must cover the schedulers' padded grid.
+
+
+_RAGGED_V_BOUNDARY_SCRIPT = """
+import sys, torch
+from cuda.bindings import driver as cu
+from flash_attn.cute.interface import flash_attn_varlen_func
+
+pack_gqa = sys.argv[1] == "1"
+torch.manual_seed(0)
+batch, seqlen_q, seqlen_k, nheads, d, dv = 1, 511, 1, 6, 128, 64
+q = torch.randn(batch * seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(batch * seqlen_k, 1, d, device="cuda", dtype=q.dtype)
+
+# V is the tail of a VMM mapping that is followed by a reserved but unmapped guard range,
+# so any TMA access past the last V row faults no matter what the allocator placed elsewhere.
+def check(res):
+    assert res[0] == cu.CUresult.CUDA_SUCCESS, res[0]
+    return res[1] if len(res) == 2 else res[1:]
+
+dev = torch.cuda.current_device()
+prop = cu.CUmemAllocationProp()
+prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+prop.location.id = dev
+gran = check(cu.cuMemGetAllocationGranularity(
+    prop, cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM))
+size, guard = gran, 4 * gran
+va = check(cu.cuMemAddressReserve(size + guard, 0, 0, 0))
+handle = check(cu.cuMemCreate(size, prop, 0))
+check(cu.cuMemMap(va, size, 0, handle, 0))
+access = cu.CUmemAccessDesc()
+access.location.type, access.location.id = prop.location.type, dev
+access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+check(cu.cuMemSetAccess(va, size, [access], 1))
+storage = torch._C._construct_storage_from_data_pointer(int(va), torch.device("cuda", dev), size)
+mapped = torch.empty(0, dtype=q.dtype, device="cuda").set_(storage).view(size // 2)
+n = batch * seqlen_k * dv
+v = mapped[-n:].view(batch * seqlen_k, 1, dv).normal_()
+assert v.data_ptr() + n * 2 == int(va) + size
+
+cu_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32)
+cu_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32)
+out = flash_attn_varlen_func(
+    q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=seqlen_q,
+    max_seqlen_k=seqlen_k, num_splits=1, pack_gqa=pack_gqa,
+)[0]
+torch.cuda.synchronize()
+assert out.isfinite().all()
+# One key per sequence: the output is that key's V row exactly.
+ref = v.view(batch, 1, dv).expand(batch, seqlen_q, dv).reshape(batch * seqlen_q, 1, dv)
+assert torch.equal(out, ref.expand(-1, nheads, -1))
+print("ok")
+"""
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100 or IS_SM110), reason="ragged K/V TMA loads")
+@pytest.mark.parametrize("pack_gqa", [False, True])
+def test_flash_attn_ragged_v_tma_allocation_boundary(pack_gqa):
+    """V ends right before a reserved, unmapped guard range, so any TMA access past the
+    last valid row faults (#3068: ~128 KB of prefetch with the wrap-around descriptor;
+    main faults on every run). Runs in a subprocess so a fault cannot poison this one."""
+    import subprocess
+    import sys
+
+    pytest.importorskip("cuda.bindings")
+    if not hasattr(torch._C, "_construct_storage_from_data_pointer"):
+        pytest.skip("needs torch._C._construct_storage_from_data_pointer")
+    env = dict(os.environ)
+    env.pop("FLASH_ATTENTION_FAKE_TENSOR", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _RAGGED_V_BOUNDARY_SCRIPT, "1" if pack_gqa else "0"],
+        env=env, capture_output=True, text=True, timeout=1800,
+    )
+    assert proc.returncode == 0 and proc.stdout.strip().endswith("ok"), proc.stderr[-4000:]
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100 block-sparse forward")
+def test_flash_attn_sm100_ragged_v_descriptor_reuse_block_sparse():
+    """Persistent CTAs rewrite the V descriptor per work tile; the block-sparse producer
+    must acquire it before its loads (a missing fence lets a CTA load V with the previous
+    sequence's extent, pulling NaN rows in)."""
+    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+    torch.manual_seed(0)
+    batch, seqlen_q, cache, nheads, d = 256, 128, 256, 4, 64
+    q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, cache, nheads, d, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    lengths = [1, 129] * (batch // 2)
+    seqused_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    for i, length in enumerate(lengths):
+        v[i, length:] = float("nan")
+    # Every KV block up to the sequence end is attended: same result as the dense call.
+    cnt = torch.tensor([(n + 127) // 128 for n in lengths], device="cuda", dtype=torch.int32)
+    cnt = cnt.view(batch, 1, 1).expand(batch, nheads, 1).contiguous()
+    idx = torch.arange(2, device="cuda", dtype=torch.int32)
+    idx = idx.view(1, 1, 1, 2).expand(batch, nheads, 1, 2).contiguous()
+    sparse = BlockSparseTensorsTorch(
+        cnt, idx, torch.zeros_like(cnt), torch.zeros_like(idx), block_size=(128, 128)
+    )
+    kwargs = dict(seqused_k=seqused_k, num_splits=1, pack_gqa=False)
+    ref = _flash_attn_fwd(q, k, v, **kwargs)[0]
+    assert ref.isfinite().all()
+    for _ in range(3):
+        out = _flash_attn_fwd(q, k, v, block_sparse_tensors=sparse, **kwargs)[0]
+        assert out.isfinite().all()
+        torch.testing.assert_close(out, ref, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.skipif(not (IS_SM90 or IS_SM100 or IS_SM110), reason="ragged K/V TMA loads")
+@pytest.mark.parametrize("packed_kv", [False, True])
+@pytest.mark.parametrize("seqlen_q", [128, 300])
+@pytest.mark.parametrize("num_splits", [1, 3])
+def test_flash_attn_ragged_tensormap_workspace_padding(packed_kv, seqlen_q, num_splits):
+    """Dense Q + seqused_q with many short sequences: the varlen schedulers pad every
+    batch by a cluster-sized tile, so the grid exceeds sum(ceil(seqlen_q / tile)) and the
+    descriptor workspace must cover it (the kernel traps otherwise)."""
+    if (IS_SM90 or IS_SM120) and num_splits > 1:
+        pytest.skip("SplitKV not supported on SM90/SM120")
+    torch.manual_seed(0)
+    batch, seqlen_k, nheads, d = 49, 217, 6, 128
+    q = torch.randn(batch, seqlen_q, nheads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, seqlen_k, nheads, d, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    seqused_q = torch.tensor(([0, 1, 127, seqlen_q] * 13)[:batch], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor(([0, 1, 129, seqlen_k] * 13)[:batch], device="cuda", dtype=torch.int32)
+    cu_k = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * seqlen_k
+    kk, vv = (k.reshape(-1, nheads, d), v.reshape(-1, nheads, d)) if packed_kv else (k, v)
+    for _ in range(2):
+        out = _flash_attn_fwd(
+            q, kk, vv, seqused_q=seqused_q, seqused_k=seqused_k,
+            cu_seqlens_k=cu_k if packed_kv else None, max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k, num_splits=num_splits, pack_gqa=False,
+        )[0]
+        torch.cuda.synchronize()
+        for i, (ql, kl) in enumerate(zip(seqused_q.tolist(), seqused_k.tolist())):
+            if ql == 0:
+                continue
+            if kl == 0:
+                ref = torch.zeros_like(out[i, :ql])
+            else:
+                ref = torch.nn.functional.scaled_dot_product_attention(
+                    q[i, :ql].float().transpose(0, 1),
+                    k[i, :kl].float().transpose(0, 1),
+                    v[i, :kl].float().transpose(0, 1),
+                ).transpose(0, 1).to(out.dtype)
+            torch.testing.assert_close(out[i, :ql], ref, atol=0.02, rtol=0.02)
+        # Change the sequence ends between calls: descriptors must be rebuilt per call.
+        seqused_k = torch.roll(seqused_k, 1)

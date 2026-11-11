@@ -8,6 +8,7 @@ from functools import partial
 import cuda.bindings.driver as cuda
 
 import cutlass
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, Boolean, const_expr
@@ -391,7 +392,7 @@ class FlashAttentionForwardCombine:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sLSE = storage.sLSE.get_tensor(smem_layout_lse)
         sMaxValidSplit = storage.sMaxValidSplit.get_tensor((self.tile_m,))

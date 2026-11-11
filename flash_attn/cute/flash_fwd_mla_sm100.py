@@ -8,6 +8,8 @@ from typing import Callable, Optional
 import cuda.bindings.driver as cuda
 
 import cutlass
+import cutlass.tensor_utils
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
 from cutlass.cute import FastDivmodDivisorV2
@@ -23,8 +25,8 @@ from flash_attn.cute.pack_gqa import (
     make_packgqa_tiled_tma_atom,
     qheads_first_tma_view,
     regroup_padded_qheads,
-    sparse_mla_qhead_tile,
 )
+from flash_attn.cute.config import mla_2cta_pads_dense_qheads, sparse_mla_qhead_tile
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute import utils as fa_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -57,8 +59,6 @@ class FlashAttentionMLAForwardSm100:
     # local memory on the sparse forward; -O2 removes it (32 B), median +15-17% on GB300
     # (AI/SPARSE_MLA_1CTA.md, "ptxas levels").
     ptxas_options = "-O2"
-    # sparse MLA: a token's heads padded to one 128-row (2-CTA) tile
-    SPARSE_HEAD_TILE = 128
 
     def __init__(
         self,
@@ -88,16 +88,19 @@ class FlashAttentionMLAForwardSm100:
         self.is_local = False
         self.pack_gqa = pack_gqa
         assert 0 < qhead_per_kvhead <= 128
-        # qhead_per_kvhead is the real head count. Sparse MLA (MQA) pads it to the tile:
-        # see pack_gqa.qheads_first_tma_view.
+        # qhead_per_kvhead is the real head count. Sparse MLA (MQA) pads it to the 128-row tile;
+        # dense MQA (config.mla_2cta_pads_dense_qheads) pads it to the next power of two, at
+        # least 64, since the heads-first Q/Qv/O TMA boxes cover one token's heads per 64-row
+        # CTA: see pack_gqa.qheads_first_tma_view.
         self.qhead_per_kvhead_valid = qhead_per_kvhead
         if is_topk_gather:
             assert pack_gqa
             qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead)
+        elif pack_gqa and mla_2cta_pads_dense_qheads(qhead_per_kvhead, nheads_kv):
+            qhead_per_kvhead = max(64, 1 << (qhead_per_kvhead - 1).bit_length())
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pad_qheads = qhead_per_kvhead != self.qhead_per_kvhead_valid
         self.nheads_kv = nheads_kv
-        self.use_tma_O = True
         self.use_cpasync_load_KV = use_cpasync_load_KV
         self.use_tma_KV = not use_cpasync_load_KV
         self.topk_length = topk_length
@@ -120,6 +123,11 @@ class FlashAttentionMLAForwardSm100:
         self.is_varlen_q = has_seqused_q or has_cu_seqlens_q
         self.use_packed_varlen_sched = has_cu_seqlens_q and qhead_per_kvhead == 128 and pack_gqa
         self.use_varlen_scheduler = self.is_varlen_q and not self.use_packed_varlen_sched
+        # Varlen Q (cu_seqlens_q or seqused_q) with heads padded to 64 rows puts several tokens in
+        # a cluster tile, which can run past its sequence, and the ragged TMA O store that keeps
+        # such tiles in bounds cannot skip padded rows: store O per row instead, guarded by
+        # seqlen_q and is_valid_qhead_row. Heads padded to 128 keep TMA O (one token per tile).
+        self.use_tma_O = not (self.pad_qheads and self.is_varlen_q and qhead_per_kvhead < 128)
 
         if const_expr(self.use_varlen_scheduler):
             self.TileScheduler = SingleTileVarlenScheduler
@@ -491,10 +499,10 @@ class FlashAttentionMLAForwardSm100:
 
         topk_length_dynamic = mIndexTopk.shape[0] if mIndexTopk is not None else None
 
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
-        self.p_layout = cutlass.utils.LayoutEnum.ROW_MAJOR
+        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
+        self.p_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
         if const_expr(self.store_P):
-            assert cutlass.utils.LayoutEnum.from_tensor(mP) == self.p_layout
+            assert cutlass.tensor_utils.LayoutEnum.from_tensor(mP) == self.p_layout
 
         mO_og = mO
         mP_og = mP
@@ -877,7 +885,7 @@ class FlashAttentionMLAForwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
 
         # ==== Allocate SMEM ====
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # ==== TMEM stuff ====
@@ -885,7 +893,7 @@ class FlashAttentionMLAForwardSm100:
             barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.TmemPtr),
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
@@ -3199,7 +3207,7 @@ class FlashAttentionMLAForwardSm100:
 
                 if const_expr(not self.use_tma_O):
                     # copy Oi rmem -> gmem
-                    if row_idx < seqlen_q:
+                    if row_idx < seqlen_q and self.is_valid_qhead_row(row_idx):
                         cute.copy(
                             thr_tiled_copy_O_r2g,
                             tOrOs_r2g[split],

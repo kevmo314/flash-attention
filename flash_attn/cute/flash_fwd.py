@@ -13,11 +13,12 @@ from functools import partial
 import cuda.bindings.driver as cuda
 
 import cutlass
+import cutlass.memory
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils
@@ -166,7 +167,7 @@ class FlashAttentionForwardBase:
         )
         smem_usage = smem_usage_QV + smem_usage_K
         # TODO: sm86 and sm89
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
+        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
         # Check if twice the block size is divisible by the number of threads
@@ -843,7 +844,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             # Get shared memory buffer
             # ///////////////////////////////////////////////////////////////////////////////
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sQ = storage.sQ.get_tensor(sQ_layout)
             sK = storage.sK.get_tensor(sK_layout)
